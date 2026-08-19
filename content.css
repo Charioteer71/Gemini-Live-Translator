@@ -1,0 +1,377 @@
+/* ==========================================================================
+   Gemini Live Translator - Floating Subtitle Overlay CSS
+   ========================================================================== */
+
+#gemini-live-sub-overlay {
+  --g-sub-opacity: 0.65;
+  --g-sub-blur: 3px;
+  --g-sub-font-size: 17px;
+
+  all: initial;
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  position: fixed;
+  top: 0px;
+  left: 0px;
+  width: 760px;
+  min-width: 260px;
+  max-width: 100vw;
+  height: 300px;
+  min-height: 160px;
+  max-height: 100vh;
+  background: rgba(16, 18, 27, var(--g-sub-opacity, 0.65));
+  backdrop-filter: blur(var(--g-sub-blur, 3px));
+  -webkit-backdrop-filter: blur(var(--g-sub-blur, 3px));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  z-index: 2147483647;
+  display: none; /* Hidden by default */
+  flex-direction: column;
+  color: #f3f4f6;
+  resize: both;
+  overflow: hidden;
+  box-sizing: border-box;
+  user-select: text;
+  transition: opacity 0.2s ease, border-color 0.2s ease;
+}
+
+#gemini-live-sub-overlay * {
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+/* Header Bar (Draggable) */
+.g-sub-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: move;
+  user-select: none;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.g-sub-brand-group {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.g-sub-logo {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.g-sub-logo span.live-badge {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.15);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 800;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+/* Play/Pause Button */
+.g-sub-toggle-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: none;
+  background: #ef4444;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.4);
+  transition: all 0.2s ease;
+}
+
+.g-sub-toggle-btn.active {
+  background: #10b981;
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.6);
+}
+
+.g-sub-toggle-btn svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+}
+
+/* Language Selection Pill */
+.g-sub-lang-pill {
+  display: flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  padding: 2px 8px;
+  font-size: 11px;
+  gap: 4px;
+}
+
+.g-sub-lang-select {
+  background: transparent;
+  border: none;
+  color: #e5e7eb;
+  font-size: 11px;
+  outline: none;
+  cursor: pointer;
+  padding: 1px;
+}
+
+.g-sub-lang-select option {
+  background: #1e2433;
+  color: #fff;
+}
+
+.g-sub-lang-arrow {
+  color: #9ca3af;
+  font-size: 10px;
+}
+
+/* Header Action Controls */
+.g-sub-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.g-sub-icon-btn {
+  background: transparent;
+  border: none;
+  color: #9ca3af;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.15s ease;
+}
+
+.g-sub-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.g-sub-icon-btn.close-btn:hover {
+  background: rgba(239, 68, 68, 0.3);
+  color: #f87171;
+}
+
+/* Settings Dropdown Panel */
+.g-sub-settings-panel {
+  display: none;
+  position: absolute;
+  top: 44px;
+  right: 12px;
+  width: 270px;
+  background: rgba(15, 23, 42, 0.96);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7);
+  z-index: 100;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.g-sub-settings-panel.show {
+  display: flex;
+}
+
+.g-sub-setting-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.g-sub-setting-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #94a3b8;
+  font-weight: 500;
+}
+
+.g-sub-setting-slider {
+  width: 100%;
+  accent-color: #38bdf8;
+  cursor: pointer;
+  height: 5px;
+}
+
+/* Domain Mode Selector Menu */
+.g-sub-domain-menu {
+  display: none;
+  position: absolute;
+  bottom: 34px;
+  left: 80px;
+  width: 230px;
+  background: rgba(15, 23, 42, 0.96);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7);
+  z-index: 100;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.g-sub-domain-menu.show {
+  display: flex;
+}
+
+.g-sub-domain-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  color: #cbd5e1;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.g-sub-domain-item:hover {
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+}
+
+.g-sub-domain-item.active {
+  background: rgba(56, 189, 248, 0.22);
+  color: #38bdf8;
+  font-weight: 600;
+}
+
+/* Subtitle Content Area (Scrollable with user-scroll awareness) */
+.g-sub-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scroll-behavior: auto;
+  position: relative;
+}
+
+/* Subtitle Entry (Dual Line) */
+.g-sub-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  animation: gSubFadeIn 0.2s ease-out;
+}
+
+@keyframes gSubFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.g-sub-orig {
+  font-size: 13px;
+  color: #94a3b8;
+  line-height: 1.4;
+  letter-spacing: 0.01em;
+}
+
+.g-sub-trans {
+  font-size: var(--g-sub-font-size, 17px);
+  font-weight: 600;
+  color: #ffffff;
+  line-height: 1.45;
+  letter-spacing: 0.015em;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+.g-sub-entry.streaming {
+  border-left: 3px solid #38bdf8;
+  padding-left: 8px;
+}
+
+.g-sub-entry.streaming .g-sub-trans {
+  color: #67e8f9;
+}
+
+/* Floating Status Bar */
+.g-sub-status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 14px;
+  background: rgba(0, 0, 0, 0.3);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.5);
+  user-select: none;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.g-sub-domain-btn {
+  font-size: 10.5px;
+  color: #38bdf8;
+  background: rgba(56,189,248,0.12);
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid rgba(56,189,248,0.28);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.g-sub-domain-btn:hover {
+  background: rgba(56,189,248,0.22);
+  border-color: rgba(56,189,248,0.5);
+}
+
+/* Scroll to Bottom Button when user scrolled up */
+.g-sub-scroll-bottom-btn {
+  display: none;
+  background: rgba(37, 99, 235, 0.85);
+  color: #fff;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  border-radius: 12px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.g-sub-scroll-bottom-btn:hover {
+  background: #2563eb;
+}
+
+/* Scrollbar */
+.g-sub-body::-webkit-scrollbar {
+  width: 5px;
+}
+.g-sub-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.g-sub-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}
+.g-sub-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
