@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemini Live Translator 设置</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="popup-header">
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <img src="icons/icon48.png" style="width: 24px; height: 24px; border-radius: 6px;" alt="Logo" />
+      <h1 class="brand-title">Gemini Live Translator</h1>
+    </div>
+    <div class="brand-badge">Release v1.0</div>
+  </header>
+
+  <main class="popup-content">
+    <!-- Preset Endpoint Switcher -->
+    <div class="preset-group">
+      <button type="button" class="preset-btn active" id="btnPresetOfficial">🌐 Google 官方 API</button>
+      <button type="button" class="preset-btn" id="btnPresetCustom">⚡ 自定义代理 / 节点</button>
+    </div>
+
+    <!-- API Host Input -->
+    <div class="form-group">
+      <div class="label-row">
+        <label class="form-label">API 节点地址 (Host / Endpoint)</label>
+        <span class="host-type-badge" id="hostTypeBadge">Google 官方</span>
+      </div>
+      <input type="text" id="apiHost" class="form-input" placeholder="https://generativelanguage.googleapis.com" value="https://generativelanguage.googleapis.com">
+      <div class="form-hint" id="hostHint">官方 WebSocket: wss://generativelanguage.googleapis.com</div>
+    </div>
+
+    <!-- API Key Input -->
+    <div class="form-group">
+      <div class="label-row">
+        <label class="form-label">API Key</label>
+        <a href="https://aistudio.google.com/apikey" target="_blank" class="link-get-key">获取免费 Key ↗</a>
+      </div>
+      <div class="input-password-wrapper">
+        <input type="password" id="apiKey" class="form-input" placeholder="AIzaSy... (直连官方必填，免密代理可留空)">
+        <button type="button" class="btn-toggle-pwd" id="btnTogglePwd" title="显示/隐藏 Key">👁️</button>
+      </div>
+      <div class="form-hint">官方 API 必须填写 Key；使用免密中继/自建代理时可留空。</div>
+    </div>
+
+    <!-- Model Select -->
+    <div class="form-group">
+      <label class="form-label">同传模型 (Model)</label>
+      <select id="modelSelect" class="form-select">
+        <option value="models/gemini-3.5-live-translate-preview" selected>models/gemini-3.5-live-translate-preview (推荐)</option>
+        <option value="models/gemini-3.1-flash-live-preview">models/gemini-3.1-flash-live-preview</option>
+        <option value="models/gemini-2.0-flash-exp">models/gemini-2.0-flash-exp</option>
+        <option value="custom">✏️ 自定义模型名称...</option>
+      </select>
+      <input type="text" id="customModelInput" class="form-input" style="display: none; margin-top: 6px;" placeholder="例如: models/gemini-xxx">
+    </div>
+
+    <!-- Language Selectors -->
+    <div class="form-row">
+      <div class="form-group half">
+        <label class="form-label">默认识别源语言</label>
+        <select id="sourceLang" class="form-select">
+          <option value="自动识别 (Auto Detect)" selected>🌐 自动识别 (推荐)</option>
+          <option value="日语 (Japanese)">🇯🇵 日语</option>
+          <option value="英语 (English)">🇺🇸 英语</option>
+          <option value="韩语 (Korean)">🇰🇷 韩语</option>
+          <option value="中文 (Chinese)">🇨🇳 中文</option>
+        </select>
+      </div>
+
+      <div class="form-group half">
+        <label class="form-label">默认目标语言</label>
+        <select id="targetLang" class="form-select">
+          <option value="中文普通话 (Chinese)" selected>🇨🇳 中文普通话</option>
+          <option value="英语 (English)">🇺🇸 英语 (English)</option>
+          <option value="日语 (Japanese)">🇯🇵 日语 (日本語)</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- UI Sliders -->
+    <div class="form-group">
+      <div class="label-row">
+        <label class="form-label">窗口不透明度 (<span id="opacityVal">65</span>%)</label>
+      </div>
+      <input type="range" id="opacity" min="10" max="100" value="65" class="form-range">
+    </div>
+
+    <div class="form-group">
+      <div class="label-row">
+        <label class="form-label">背景毛玻璃模糊度 (<span id="blurVal">3</span>px)</label>
+      </div>
+      <input type="range" id="blur" min="0" max="20" value="3" class="form-range">
+    </div>
+
+    <div class="form-group">
+      <div class="label-row">
+        <label class="form-label">译文字号 (<span id="fontSizeVal">17</span>px)</label>
+      </div>
+      <input type="range" id="fontSize" min="12" max="30" value="17" class="form-range">
+    </div>
+
+    <button type="button" id="btnSave" class="btn-save">💾 保存并应用设置</button>
+    <div class="config-sync-group">
+      <button type="button" id="btnExportConfig" class="btn-sync" title="导出当前所有设置为 JSON 文件，方便备份或同步给副机">📤 导出配置 (.json)</button>
+      <button type="button" id="btnImportConfig" class="btn-sync" title="导入 JSON 配置文件并立即应用">📥 导入配置 (.json)</button>
+      <input type="file" id="importFileInput" accept=".json" style="display: none;">
+    </div>
+  </main>
+
+  <footer class="popup-footer">
+    💡 提示：在网页悬浮窗顶部点击 <b>⚙️</b> 图标，可直接在视频画面上实时调整透明度与字号！
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

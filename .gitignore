@@ -1,0 +1,8 @@
+# Agent workspace and temporary artifacts
+.agents/
+test_challenger*.js
+test_e2e*.js
+test_m2.js
+PROJECT.md
+.DS_Store
+node_modules/
