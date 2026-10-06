@@ -1432,6 +1432,17 @@ RULES:
   document.addEventListener('mozfullscreenchange', handleFullscreenChange);
   document.addEventListener('MSFullscreenChange', handleFullscreenChange);
 
+  // Synchronization with fullscreen-bridge.js running in page MAIN world
+  window.addEventListener('message', (event) => {
+    const data = event.data;
+    if (!data || data.type !== 'gemini-live:fullscreen-request' || !data.id) return;
+    handleFullscreenChange();
+    window.postMessage({
+      type: 'gemini-live:fullscreen-ready',
+      id: data.id
+    }, '*');
+  }, true);
+
   // Clean shutdown on page unload / navigate away
   window.addEventListener('pagehide', () => {
     if (isRunning) {

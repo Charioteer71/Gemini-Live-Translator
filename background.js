@@ -59,6 +59,11 @@ async function ensureContentScriptInjected(tabId) {
   } catch (e) {
     try {
       await chrome.scripting.insertCSS({ target: { tabId }, files: ['content.css'] });
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['fullscreen-bridge.js'],
+        world: 'MAIN'
+      }).catch(() => {});
       await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
       await new Promise(r => setTimeout(r, 120));
       return true;
