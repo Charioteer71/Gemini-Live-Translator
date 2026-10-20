@@ -343,22 +343,8 @@
     activeDomain = pageCtx.domain;
 
     if (isRunning && ws && ws.readyState === WebSocket.OPEN) {
-      const tgtRule = getTargetLanguageRule(config.targetLang);
-      const steeringPrompt = `[语境切换]已切换为【${pageCtx.domainLabel}】模式，请以此语境风格同传。`;
-      const directiveTurn = {
-        clientContent: {
-          turns: [
-            {
-              role: 'user',
-              parts: [{ text: steeringPrompt }]
-            }
-          ],
-          turnComplete: true
-        }
-      };
-      try {
-        ws.send(JSON.stringify(directiveTurn));
-      } catch (err) {}
+      console.log(`[Gemini Live] Domain switched to ${pageCtx.domainLabel}, refreshing session with new prompt...`);
+      restartSession();
     }
   }
 
@@ -933,20 +919,9 @@ RULES:
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const tgtRule = getTargetLanguageRule(config.targetLang);
 
-    if (isLanguageDrifted(chunk, tgtRule.id) && Date.now() - lastDriftWarningTime > 1000) {
+    if (isLanguageDrifted(chunk, tgtRule.id) && Date.now() - lastDriftWarningTime > 5000) {
       lastDriftWarningTime = Date.now();
-      console.warn(`[Gemini Live] Target language drift detected (${tgtRule.name}), sending immediate steering turn...`);
-      try {
-        ws.send(JSON.stringify({
-          clientContent: {
-            turns: [{
-              role: 'user',
-              parts: [{ text: tgtRule.driftWarning }]
-            }],
-            turnComplete: true
-          }
-        }));
-      } catch (e) {}
+      console.warn(`[Gemini Live] Target language drift detected (${tgtRule.name}) in translation.`);
     }
   }
 
@@ -1634,10 +1609,10 @@ RULES:
       }
     }, 500);
 
-    // Natural sentence boundary flush timer (1800ms natural clause check, 4500ms force flush)
+    // Natural sentence boundary flush timer (1400ms natural clause check, 3000ms force flush)
     silenceFlushTimer = setInterval(() => {
-      if (isRunning && Date.now() - lastAudioTime > 1800) {
-        const isLongSilence = (Date.now() - lastAudioTime > 4500);
+      if (isRunning && Date.now() - lastAudioTime > 1400) {
+        const isLongSilence = (Date.now() - lastAudioTime > 3000);
         commitActiveSentence(isLongSilence);
       }
     }, 300);
@@ -1910,7 +1885,7 @@ RULES:
 
             // Signal D: Sentence or Turn Completion Boundary
             if (sc.turnComplete || sc.generationComplete) {
-              commitActiveSentence(false);
+              commitActiveSentence(true);
             }
           }
         } catch (err) {
