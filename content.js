@@ -56,6 +56,23 @@
     return String(url).replace(/([?&]key=)[^&\s'"]+/gi, '$1***REDACTED***');
   }
 
+  function isLiveTranslateModel(model) {
+    return typeof model === 'string' && model.includes('live-translate');
+  }
+
+  function getBcp47LanguageCode(targetLang) {
+    const t = (targetLang || '').toLowerCase();
+    if (t.includes('中文') || t.includes('chinese') || t.includes('zh')) return 'zh';
+    if (t.includes('日语') || t.includes('japanese') || t.includes('ja')) return 'ja';
+    if (t.includes('英语') || t.includes('english') || t.includes('en')) return 'en';
+    if (t.includes('韩语') || t.includes('korean') || t.includes('ko')) return 'ko';
+    if (t.includes('西班') || t.includes('spanish') || t.includes('es')) return 'es';
+    if (t.includes('法') || t.includes('french') || t.includes('fr')) return 'fr';
+    if (t.includes('德') || t.includes('german') || t.includes('de')) return 'de';
+    if (t.includes('俄') || t.includes('russian') || t.includes('ru')) return 'ru';
+    return 'zh';
+  }
+
   /**
    * Exponential Backoff with Jitter:
    * delay = Math.min(1000 * 2^attempt * (0.8 + Math.random() * 0.4), 16000)
@@ -324,7 +341,7 @@
     domainText.textContent = pageCtx.domainLabel;
     activeDomain = pageCtx.domain;
 
-    if (isRunning && ws && ws.readyState === WebSocket.OPEN) {
+    if (isRunning && ws && ws.readyState === WebSocket.OPEN && !isLiveTranslateModel(config.model)) {
       const tgtRule = getTargetLanguageRule(config.targetLang);
       const steeringPrompt = `[语境切换]已切换为【${pageCtx.domainLabel}】模式，请以此语境风格同传。`;
       const directiveTurn = {
@@ -896,6 +913,7 @@ RULES:
 
   let lastDriftWarningTime = 0;
   function checkAndCorrectLanguageDrift(chunk) {
+    if (isLiveTranslateModel(config.model)) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const tgtRule = getTargetLanguageRule(config.targetLang);
 
@@ -1742,21 +1760,37 @@ RULES:
         domainText.textContent = pageCtx.domainLabel;
         activeDomain = pageCtx.domain;
 
-        const dynamicPrompt = buildDynamicSystemPrompt(pageCtx);
-
-        const setupPayload = {
-          setup: {
-            model: config.model,
-            generationConfig: {
-              responseModalities: ['TEXT'],
-              temperature: 0.3
-            },
-            inputAudioTranscription: {},
-            systemInstruction: {
-              parts: [{ text: dynamicPrompt }]
+        let setupPayload;
+        if (isLiveTranslateModel(config.model)) {
+          setupPayload = {
+            setup: {
+              model: config.model,
+              generationConfig: {
+                responseModalities: ['AUDIO'],
+                translationConfig: {
+                  targetLanguageCode: getBcp47LanguageCode(config.targetLang)
+                }
+              },
+              inputAudioTranscription: {},
+              outputAudioTranscription: {}
             }
-          }
-        };
+          };
+        } else {
+          const dynamicPrompt = buildDynamicSystemPrompt(pageCtx);
+          setupPayload = {
+            setup: {
+              model: config.model,
+              generationConfig: {
+                responseModalities: ['TEXT'],
+                temperature: 0.3
+              },
+              inputAudioTranscription: {},
+              systemInstruction: {
+                parts: [{ text: dynamicPrompt }]
+              }
+            }
+          };
+        }
 
         currentWs.send(JSON.stringify(setupPayload));
       };
@@ -1827,16 +1861,21 @@ RULES:
             }
 
             // Signal C: Output Translation Stream (Real-time Streaming Text)
-            if (sc.modelTurn && sc.modelTurn.parts) {
+            let handledTranslatedText = false;
+            if (sc.outputTranscription && sc.outputTranscription.text) {
+              handleIncomingTranslatedChunk(sc.outputTranscription.text);
+              handledTranslatedText = true;
+            }
+            if (sc.outputAudioTranscription && sc.outputAudioTranscription.text) {
+              handleIncomingTranslatedChunk(sc.outputAudioTranscription.text);
+              handledTranslatedText = true;
+            }
+            if (!handledTranslatedText && sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
               for (const part of sc.modelTurn.parts) {
-                if (part.text) {
+                if (part && part.text) {
                   handleIncomingTranslatedChunk(part.text);
                 }
               }
-            } else if (sc.outputTranscription && sc.outputTranscription.text) {
-              handleIncomingTranslatedChunk(sc.outputTranscription.text);
-            } else if (sc.outputAudioTranscription && sc.outputAudioTranscription.text) {
-              handleIncomingTranslatedChunk(sc.outputAudioTranscription.text);
             }
 
             // Signal D: Sentence or Turn Completion Boundary

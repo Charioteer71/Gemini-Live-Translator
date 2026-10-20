@@ -458,6 +458,21 @@ test('T3.4: Gemini Live Protocol Signals & Error Propagation', () => {
   assert(contentCode.includes('catch (audioErr)'), 'setupComplete handler must catch initAudioCapture failures');
 });
 
+test('T3.6: Gemini Live Translate Dual-Mode Architecture & Setup Formulation', () => {
+  assert(contentCode.includes('function isLiveTranslateModel'), 'content.js must define isLiveTranslateModel');
+  assert(contentCode.includes('function getBcp47LanguageCode'), 'content.js must define getBcp47LanguageCode');
+  assert(contentCode.includes('translationConfig:'), 'content.js must support translationConfig');
+  assert(contentCode.includes('outputAudioTranscription:'), 'content.js must request outputAudioTranscription');
+  assert(contentCode.includes('sc.outputTranscription'), 'content.js must process outputTranscription');
+
+  const bcpMatch = contentCode.match(/function getBcp47LanguageCode\([^\)]*\)\s*\{([\s\S]*?)\n  \}/);
+  assert(bcpMatch, 'getBcp47LanguageCode must be extracted');
+  const getBcp = new Function('targetLang', bcpMatch[1]);
+  assert.strictEqual(getBcp('中文普通话 (Chinese)'), 'zh');
+  assert.strictEqual(getBcp('日语 (Japanese)'), 'ja');
+  assert.strictEqual(getBcp('英语 (English)'), 'en');
+});
+
 test('T3.5: WebSocket URL Normalization & Key Parameter Formulation', () => {
   const getWebSocketUrlMatch = contentCode.match(/function getWebSocketUrl\(\)\s*\{([\s\S]*?)\n  \}/);
   assert(getWebSocketUrlMatch, 'getWebSocketUrl function must be present');

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Live Translator (实时双语同传字幕)",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "基于 Google Gemini 官方 Live 多模态实时音频流 API 的浏览器双语同传字幕扩展，专为影视动漫、学术演讲、VTuber 直播及游戏解说设计。",
   "permissions": [
     "storage",
