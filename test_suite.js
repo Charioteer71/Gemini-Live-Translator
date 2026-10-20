@@ -458,12 +458,14 @@ test('T3.4: Gemini Live Protocol Signals & Error Propagation', () => {
   assert(contentCode.includes('catch (audioErr)'), 'setupComplete handler must catch initAudioCapture failures');
 });
 
-test('T3.6: Gemini Live Translate Dual-Mode Architecture & Setup Formulation', () => {
+test('T3.6: Gemini Live Streaming Architecture, Macro Steering & Anti-Fragmentation', () => {
   assert(contentCode.includes('function isLiveTranslateModel'), 'content.js must define isLiveTranslateModel');
   assert(contentCode.includes('function getBcp47LanguageCode'), 'content.js must define getBcp47LanguageCode');
-  assert(contentCode.includes('translationConfig:'), 'content.js must support translationConfig');
+  assert(contentCode.includes('systemInstruction:'), 'content.js must support systemInstruction macro guidance');
   assert(contentCode.includes('outputAudioTranscription:'), 'content.js must request outputAudioTranscription');
   assert(contentCode.includes('sc.outputTranscription'), 'content.js must process outputTranscription');
+  assert(contentCode.includes('IS_STANDALONE_FILLER.test(trimmed)'), 'content.js must protect against filler fragments');
+  assert(contentCode.includes('ZH_UNFINISHED_TAIL.test(trimmed)'), 'content.js must protect against unfinished tails');
 
   const bcpMatch = contentCode.match(/function getBcp47LanguageCode\([^\)]*\)\s*\{([\s\S]*?)\n  \}/);
   assert(bcpMatch, 'getBcp47LanguageCode must be extracted');

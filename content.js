@@ -342,7 +342,7 @@
     domainText.textContent = pageCtx.domainLabel;
     activeDomain = pageCtx.domain;
 
-    if (isRunning && ws && ws.readyState === WebSocket.OPEN && !isLiveTranslateModel(config.model)) {
+    if (isRunning && ws && ws.readyState === WebSocket.OPEN) {
       const tgtRule = getTargetLanguageRule(config.targetLang);
       const steeringPrompt = `[语境切换]已切换为【${pageCtx.domainLabel}】模式，请以此语境风格同传。`;
       const directiveTurn = {
@@ -749,7 +749,7 @@
     return trimmedTrans.length >= 35;
   }
 
-  function commitActiveSentence() {
+  function commitActiveSentence(force = false) {
     const trimmed = currentTransBuffer.trim();
     if (!trimmed) {
       if (currentStreamingEntry && !currentOrigBuffer.trim()) {
@@ -757,6 +757,22 @@
         currentStreamingEntry = null;
       }
       return;
+    }
+
+    // Anti-fragment protection on silence timeout: if not forced (e.g. video pause/stop),
+    // do not commit if it's standalone filler, unfinished tail, or short without terminal punctuation
+    if (!force) {
+      if (IS_STANDALONE_FILLER.test(trimmed)) {
+        return;
+      }
+      if (trimmed.length < 8 && !/[。！？!?\n]/.test(trimmed)) {
+        return;
+      }
+      if (ZH_UNFINISHED_TAIL.test(trimmed) || 
+          JA_UNFINISHED_TAIL.test(currentOrigBuffer.trim()) || 
+          EN_UNFINISHED_TAIL.test(currentOrigBuffer.trim())) {
+        return;
+      }
     }
 
     if (currentStreamingEntry) {
@@ -914,7 +930,6 @@ RULES:
 
   let lastDriftWarningTime = 0;
   function checkAndCorrectLanguageDrift(chunk) {
-    if (isLiveTranslateModel(config.model)) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const tgtRule = getTargetLanguageRule(config.targetLang);
 
@@ -1312,13 +1327,13 @@ RULES:
 
   function onVideoSeeking() {
     if (isRunning) {
-      commitActiveSentence();
+      commitActiveSentence(true);
     }
   }
 
   function onVideoPause() {
     if (isRunning) {
-      commitActiveSentence();
+      commitActiveSentence(true);
       if (statusText && !isConnecting) {
         statusText.textContent = '⏸️ 视频已暂停';
         statusText.style.color = '#94a3b8';
@@ -1619,10 +1634,11 @@ RULES:
       }
     }, 500);
 
-    // Natural sentence boundary flush timer (1400ms)
+    // Natural sentence boundary flush timer (1800ms natural clause check, 4500ms force flush)
     silenceFlushTimer = setInterval(() => {
-      if (isRunning && Date.now() - lastAudioTime > 1400) {
-        commitActiveSentence();
+      if (isRunning && Date.now() - lastAudioTime > 1800) {
+        const isLongSilence = (Date.now() - lastAudioTime > 4500);
+        commitActiveSentence(isLongSilence);
       }
     }, 300);
 
@@ -1785,37 +1801,21 @@ RULES:
         domainText.textContent = pageCtx.domainLabel;
         activeDomain = pageCtx.domain;
 
-        let setupPayload;
-        if (isLiveTranslateModel(config.model)) {
-          setupPayload = {
-            setup: {
-              model: config.model,
-              generationConfig: {
-                responseModalities: ['AUDIO'],
-                translationConfig: {
-                  targetLanguageCode: getBcp47LanguageCode(config.targetLang)
-                }
-              },
-              inputAudioTranscription: {},
-              outputAudioTranscription: {}
+        const dynamicPrompt = buildDynamicSystemPrompt(pageCtx);
+        const setupPayload = {
+          setup: {
+            model: config.model,
+            generationConfig: {
+              responseModalities: ['TEXT'],
+              temperature: 0.3
+            },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            systemInstruction: {
+              parts: [{ text: dynamicPrompt }]
             }
-          };
-        } else {
-          const dynamicPrompt = buildDynamicSystemPrompt(pageCtx);
-          setupPayload = {
-            setup: {
-              model: config.model,
-              generationConfig: {
-                responseModalities: ['TEXT'],
-                temperature: 0.3
-              },
-              inputAudioTranscription: {},
-              systemInstruction: {
-                parts: [{ text: dynamicPrompt }]
-              }
-            }
-          };
-        }
+          }
+        };
 
         currentWs.send(JSON.stringify(setupPayload));
       };
@@ -1882,7 +1882,7 @@ RULES:
 
             // Signal A: Interruption Event (User interrupted or audio stream reset)
             if (sc.interrupted) {
-              commitActiveSentence();
+              commitActiveSentence(true);
             }
 
             // Signal B: Original Input Audio Transcription
@@ -1910,7 +1910,7 @@ RULES:
 
             // Signal D: Sentence or Turn Completion Boundary
             if (sc.turnComplete || sc.generationComplete) {
-              commitActiveSentence();
+              commitActiveSentence(false);
             }
           }
         } catch (err) {
