@@ -12,7 +12,7 @@
       <img src="icons/icon48.png" style="width: 24px; height: 24px; border-radius: 6px;" alt="Logo" />
       <h1 class="brand-title">Gemini Live Translator</h1>
     </div>
-    <div class="brand-badge">Release v1.0.4</div>
+    <div class="brand-badge">Release v1.0.5</div>
   </header>
 
   <main class="popup-content">
@@ -54,6 +54,13 @@
         <option value="custom">✏️ 自定义模型名称...</option>
       </select>
       <input type="text" id="customModelInput" class="form-input" style="display: none; margin-top: 6px;" placeholder="例如: models/gemini-xxx">
+      <div class="form-hint" id="modelHint">💡 原生同传模型（live-translate）连续流式翻译、稳定性最佳，但不读取系统提示词；Agent 模型（flash-live）支持语境提示词，按语音停顿分段翻译。</div>
+    </div>
+
+    <!-- Connection Self-Test -->
+    <div class="form-group">
+      <button type="button" id="btnTestConn" class="preset-btn" style="width: 100%;">🔌 测试节点连接（不消耗字幕额度）</button>
+      <div class="form-hint" id="testResult" style="min-height: 16px; line-height: 1.5;">点击后向当前节点发起一次 WebSocket 握手自检。</div>
     </div>
 
     <!-- Language Selectors -->

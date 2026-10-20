@@ -265,4 +265,150 @@ document.addEventListener('DOMContentLoaded', async () => {
       });
     });
   });
+
+  // ======================================================================
+  // 节点连接自检（WebSocket 握手 → setupComplete 往返耗时）
+  // ======================================================================
+
+  const btnTestConn = document.getElementById('btnTestConn');
+  const testResult = document.getElementById('testResult');
+
+  function mapTargetLanguageCode(value) {
+    const t = String(value || '').toLowerCase();
+    if (t.includes('英语') || t.includes('english')) return 'en';
+    if (t.includes('日语') || t.includes('japanese')) return 'ja';
+    return 'zh-Hans';
+  }
+
+  function buildTestWsUrl(hostRaw, key) {
+    let host = String(hostRaw || '').trim() || OFFICIAL_HOST;
+    if (/^http:\/\//i.test(host)) host = 'ws://' + host.substring(7);
+    else if (/^https:\/\//i.test(host)) host = 'wss://' + host.substring(8);
+    else if (!/^wss?:\/\//i.test(host)) host = 'wss://' + host;
+
+    host = host.replace(/\/+$/, '')
+      .replace(/\/v1beta\/models\/?$/i, '')
+      .replace(/\/v1beta\/?$/i, '')
+      .replace(/\/models\/?$/i, '');
+
+    if (!/\/ws\/google\.ai\.generativelanguage\./i.test(host)) {
+      host += '/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+    }
+    if (key && String(key).trim() && !/[?&]key=/.test(host)) {
+      host += (host.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(String(key).trim());
+    }
+    return host;
+  }
+
+  function getSelectedModel() {
+    let chosen = modelSelect.value;
+    if (chosen === 'custom') chosen = customModelInput.value.trim() || 'models/gemini-3.5-live-translate-preview';
+    return chosen.replace(/^models\//i, '');
+  }
+
+  let testSocket = null;
+
+  function runConnectionTest() {
+    const host = apiHost.value.trim() || OFFICIAL_HOST;
+    const key = apiKey.value.trim();
+    const model = getSelectedModel();
+    const isOfficial = host.includes('generativelanguage.googleapis.com');
+
+    if (isOfficial && !key) {
+      testResult.textContent = '⚠️ 直连 Google 官方 API 需要先填写 API Key。';
+      testResult.style.color = '#f59e0b';
+      return;
+    }
+
+    if (testSocket) {
+      try { testSocket.close(); } catch (e) {}
+      testSocket = null;
+    }
+
+    testResult.textContent = '⏳ 正在连接' + (isOfficial ? ' Google 官方节点' : '自定义节点') + '…';
+    testResult.style.color = '#38bdf8';
+    btnTestConn.disabled = true;
+
+    const t0 = performance.now();
+    let settled = false;
+    let timer = null;
+
+    const finish = (ok, text) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      btnTestConn.disabled = false;
+      testResult.textContent = text;
+      testResult.style.color = ok ? '#34d399' : '#ef4444';
+      try { if (testSocket) testSocket.close(); } catch (e) {}
+      testSocket = null;
+    };
+
+    let ws;
+    try {
+      ws = new WebSocket(buildTestWsUrl(host, key));
+    } catch (e) {
+      finish(false, '❌ 地址无效: ' + (e && e.message ? e.message : e));
+      return;
+    }
+    testSocket = ws;
+    timer = setTimeout(() => finish(false, '❌ 35s 内未收到 setupComplete（网关握手超时/节点不可达）'), 35000);
+
+    ws.onopen = () => {
+      testResult.textContent = '⚡ WebSocket 已连接，正在发送 setup 帧…';
+      const isTranslate = /live-translate/i.test(model);
+      let setup;
+      if (isTranslate) {
+        setup = {
+          setup: {
+            model: 'models/' + model,
+            generationConfig: {
+              responseModalities: ['AUDIO'],
+              translationConfig: {
+                targetLanguageCode: mapTargetLanguageCode(targetLang.value),
+                echoTargetLanguage: true
+              }
+            },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {}
+          }
+        };
+      } else {
+        setup = {
+          setup: {
+            model: 'models/' + model,
+            generationConfig: { responseModalities: ['TEXT'], temperature: 0.3 },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            systemInstruction: { parts: [{ text: 'You are a real-time interpreter. Translate all incoming audio into ' + mapTargetLanguageCode(targetLang.value) + '.' }] }
+          }
+        };
+      }
+      try {
+        ws.send(JSON.stringify(setup));
+      } catch (e) {
+        finish(false, '❌ 发送 setup 失败: ' + (e && e.message ? e.message : e));
+      }
+    };
+
+    ws.onmessage = (ev) => {
+      const text = typeof ev.data === 'string' ? ev.data : '';
+      if (!text) return;
+      let msg;
+      try { msg = JSON.parse(text); } catch (e) { return; }
+      if (msg.setupComplete !== undefined) {
+        const ms = Math.round(performance.now() - t0);
+        finish(true, `✅ 握手成功！setupComplete 往返 ${ms} ms（模型 ${model}）`);
+      } else if (msg.error) {
+        finish(false, '❌ 服务端拒绝: ' + (msg.error.message || JSON.stringify(msg.error)).slice(0, 160));
+      }
+    };
+
+    ws.onerror = () => {};
+    ws.onclose = (ev) => {
+      if (!settled) finish(false, `❌ 连接被关闭 (code ${ev.code}${ev.reason ? '，' + ev.reason : ''})`);
+    };
+  }
+
+  if (btnTestConn) btnTestConn.addEventListener('click', runConnectionTest);
 });

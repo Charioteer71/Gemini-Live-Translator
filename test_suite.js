@@ -110,8 +110,13 @@ const sanitizeUrl = extractFunctionFromCode(contentCode, 'sanitizeUrl');
 const calculateBackoffDelay = extractFunctionFromCode(contentCode, 'calculateBackoffDelay');
 const isTerminalError = extractFunctionFromCode(contentCode, 'isTerminalError');
 const detectLanguageFromText = extractFunctionFromCode(contentCode, 'detectLanguageFromText');
-const isLanguageDrifted = extractFunctionFromCode(contentCode, 'isLanguageDrifted');
+const isLiveTranslateModel = extractFunctionFromCode(contentCode, 'isLiveTranslateModel');
 const escapeHtml = extractFunctionFromCode(contentCode, 'escapeHtml');
+
+// Extract getBcp47LanguageCode (需要独立求值，函数体无外部常量依赖)
+const bcpFnMatch = contentCode.match(/function getBcp47LanguageCode\([^\)]*\)\s*\{([\s\S]*?)\n  \}/);
+if (!bcpFnMatch) throw new Error('Could not extract getBcp47LanguageCode from content.js');
+const getBcp47LanguageCode = new Function('targetLang', bcpFnMatch[1]);
 
 // Extract uint8ToBase64
 const uint8ToBase64Match = contentCode.match(/function uint8ToBase64\([\s\S]*?\n  \}/);
@@ -278,7 +283,7 @@ test('T2.3: Chunked 8192-byte Base64 Encoder Integrity & Precision', () => {
 
 test('T2.4: Audio Source Node WeakMap Caching & InvalidStateError Prevention', () => {
   // Verify content.js uses WeakMap mediaSourceCache
-  assert(contentCode.includes('const mediaSourceCache = new WeakMap()'), 'content.js must instantiate mediaSourceCache as WeakMap');
+  assert(contentCode.includes('mediaSourceCache = new WeakMap()'), 'content.js must instantiate mediaSourceCache as WeakMap');
   assert(contentCode.includes('mediaSourceCache.get(video)'), 'content.js must query mediaSourceCache before creating source node');
   assert(contentCode.includes('mediaSourceCache.set(video,'), 'content.js must cache created source nodes');
   assert(contentCode.includes('rebindActiveVideo'), 'content.js must implement rebindActiveVideo for dynamic switching');
@@ -312,7 +317,7 @@ test('T2.4: Audio Source Node WeakMap Caching & InvalidStateError Prevention', (
 test('T2.5: Microphone Hardware Stream Track Immediate Teardown', () => {
   // Static checks in cleanupAudioPipeline and initAudioCapture
   assert(contentCode.includes('mediaStream.getTracks().forEach'), 'cleanupAudioPipeline must iterate mediaStream tracks');
-  assert(contentCode.includes('track.stop()'), 'cleanupAudioPipeline must invoke track.stop()');
+  assert(contentCode.includes('track.stop()') || contentCode.includes('t.stop()'), 'cleanupAudioPipeline must invoke track.stop()');
 
   // Behavioral mock verification
   let stoppedTrackCount = 0;
@@ -360,55 +365,53 @@ test('T2.5: Microphone Hardware Stream Track Immediate Teardown', () => {
 // ============================================================================
 startTier('TIER 3', 'WebSocket Protocol, Error Recovery & Security Hardening');
 
-test('T3.1: Exponential Backoff Calculation with Jitter (1s, 2s, 4s, 8s, 16s ±20%)', () => {
+test('T3.1: Exponential Backoff Calculation with Jitter (0.6s,1.2s,2.4s,4.8s,8s ±20%, cap 8s)', () => {
+  const BASE_MS = 600;
+  const CAP_MS = 8000;
   for (let attempt = 0; attempt < 5; attempt++) {
-    const base = 1000 * Math.pow(2, attempt);
+    const base = BASE_MS * Math.pow(2, attempt);
     const minExpected = Math.round(base * 0.8);
-    const maxExpected = Math.min(Math.round(base * 1.2), 16000);
-
+    const maxExpected = Math.min(Math.round(base * 1.2), CAP_MS);
     for (let trial = 0; trial < 100; trial++) {
       const delay = calculateBackoffDelay(attempt);
       assert(delay >= minExpected - 1, `Attempt ${attempt}: delay ${delay}ms below min ${minExpected}ms`);
       assert(delay <= maxExpected + 1, `Attempt ${attempt}: delay ${delay}ms above max ${maxExpected}ms`);
-      assert(delay <= 16000, `Attempt ${attempt}: delay ${delay}ms exceeded 16000ms ceiling`);
+      assert(delay <= CAP_MS, `Attempt ${attempt}: delay ${delay}ms exceeded ${CAP_MS}ms ceiling`);
     }
   }
-
-  // Attempt >= 5 must strictly cap at 16000ms
-  for (let attempt = 5; attempt <= 10; attempt++) {
+  // Attempt >= 5 必须严格封顶 8000ms（网关慢握手场景下仍需快速恢复，不无限指数增长）
+  for (let attempt = 5; attempt <= 12; attempt++) {
     for (let trial = 0; trial < 20; trial++) {
-      const delay = calculateBackoffDelay(attempt);
-      assert.strictEqual(delay, 16000, `Attempt ${attempt} must cap at 16000ms`);
+      assert.strictEqual(calculateBackoffDelay(attempt), CAP_MS, `Attempt ${attempt} must cap at ${CAP_MS}ms`);
     }
   }
 });
 
 test('T3.2: Terminal Error Discrimination for Fatal vs. Transient Errors', () => {
-  // Terminal Error Codes & Reasons (Auth, Key, Quota, Policy)
+  // 只有「明确的 Key/鉴权无效」才应终止；网关轮询场景下 1008/4xxx/配额类错误必须当作可重试
   const terminalCases = [
-    { code: 1008, reason: 'Policy Violation' },
-    { code: 4400, reason: 'Bad Request' },
-    { code: 4401, reason: 'Unauthorized' },
-    { code: 4403, reason: 'Forbidden' },
     { code: 400, reason: 'API_KEY_INVALID' },
-    { code: 401, reason: 'UNAUTHENTICATED' },
+    { code: 400, reason: 'API key not valid. Please pass a valid API key.' },
+    { code: 401, reason: 'UNAUTHENTICATED: API key not valid' },
     { code: 403, reason: 'PERMISSION_DENIED' },
-    { code: 404, reason: 'Model not found' },
-    { code: 1000, reason: 'RESOURCE_EXHAUSTED' },
-    { code: 1000, reason: 'Quota exceeded for project 12345' },
-    { code: 1000, reason: 'BILLING_DISABLED' },
-    { code: 1000, reason: 'API key not valid. Please pass a valid API key.' }
+    { code: 1000, reason: 'API key expired. Please renew the API key.' }
   ];
 
   for (const c of terminalCases) {
     assert.strictEqual(isTerminalError(c.code, c.reason), true, `Case ${JSON.stringify(c)} must be classified as terminal`);
   }
 
-  // Transient Error Codes & Reasons (Network drops, Cloud flakiness)
+  // Transient：网络抖动 / 网关轮换 Key 限流 / 服务端临时错误（必须继续重连）
   const transientCases = [
+    { code: 1008, reason: 'Policy Violation' },
+    { code: 4400, reason: 'Bad Request' },
+    { code: 4401, reason: 'Unauthorized' },
+    { code: 4403, reason: 'Forbidden' },
+    { code: 404, reason: 'Model not found' },
+    { code: 1000, reason: 'RESOURCE_EXHAUSTED: Quota exceeded for project 12345' },
+    { code: 1000, reason: 'BILLING_DISABLED' },
     { code: 1000, reason: 'Normal Closure' },
     { code: 1001, reason: 'Going Away' },
-    { code: 1005, reason: 'No Status Received' },
     { code: 1006, reason: 'Abnormal Closure' },
     { code: 0, reason: 'Connection timeout' },
     { code: 0, reason: 'Socket closed unexpectedly' }
@@ -419,60 +422,109 @@ test('T3.2: Terminal Error Discrimination for Fatal vs. Transient Errors', () =>
   }
 });
 
-test('T3.3: Async Session Generation Race Guarding (activeSessionId)', () => {
-  assert(contentCode.includes('let activeSessionId = 0'), 'content.js must declare activeSessionId counter');
-  assert(contentCode.includes('const currentSession = ++activeSessionId'), 'startSubtitleService must increment activeSessionId');
-  assert(contentCode.includes('if (sessionId !== activeSessionId || !isRunning)'), 'content.js must guard asynchronous returns with session checks');
+test('T3.3: Session State Machine & Async Race Guarding', () => {
+  assert(contentCode.includes('let sessionSeq = 0'), 'content.js must declare sessionSeq counter');
+  assert(contentCode.includes('function createSession('), 'content.js must define createSession');
+  assert(contentCode.includes('function closeSession('), 'content.js must define closeSession');
+  assert(contentCode.includes('function scheduleReconnect('), 'content.js must define scheduleReconnect');
+  assert(contentCode.includes('if (session !== activeSession)'), 'content.js must guard stale-session events against activeSession');
+  assert(contentCode.includes('session.intentionallyClosed'), 'content.js must track intentional closes to avoid reconnect storms');
+  assert(contentCode.includes('if (!isRunning) return;'), 'session callbacks must check isRunning before acting');
 
-  // Simulation of abort race condition
-  let activeSessionId = 1;
-  let isRunning = true;
-  let tracksStopped = false;
-
-  async function mockGetUserMedia(sessionId) {
-    await new Promise(r => setTimeout(r, 10));
-    const stream = {
-      getTracks: () => [{ stop: () => { tracksStopped = true; } }]
-    };
-    // If user stopped in between:
-    if (sessionId !== activeSessionId || !isRunning) {
-      stream.getTracks().forEach(t => t.stop());
-      return null;
-    }
-    return stream;
+  // 模拟：旧会话在关闭后仍收到消息，不得污染当前 activeSession 的字幕缓冲
+  function makeState() {
+    return { activeSession: null, lines: 0 };
   }
-
-  // Launch session 1, then immediately cancel by launching session 2
-  const p1 = mockGetUserMedia(1);
-  activeSessionId = 2; // user started new session or stopped
-  return p1.then(result => {
-    assert.strictEqual(result, null, 'Stale session promise must resolve to null');
-    assert.strictEqual(tracksStopped, true, 'Stale session tracks must be stopped immediately');
-  });
+  const state = makeState();
+  const s1 = { id: 1, state: 'ready' };
+  const s2 = { id: 2, state: 'ready' };
+  state.activeSession = s1;
+  function handleMessage(session, role) {
+    if (session !== state.activeSession) return false;
+    return role === 'transcript';
+  }
+  state.activeSession = s2; // 轮转：s1 被替换
+  assert.strictEqual(handleMessage(s1, 'transcript'), false, 'Stale session transcripts must be dropped');
+  assert.strictEqual(handleMessage(s2, 'transcript'), true, 'Active session transcripts must be rendered');
 });
 
 test('T3.4: Gemini Live Protocol Signals & Error Propagation', () => {
   assert(contentCode.includes('sc.interrupted'), 'content.js must handle serverContent.interrupted');
   assert(contentCode.includes('sc.turnComplete'), 'content.js must handle serverContent.turnComplete');
+  assert(contentCode.includes('msg.goAway'), 'content.js must handle serverContent goAway for session rotation');
   assert(contentCode.includes('if (msg.error)'), 'content.js must inspect incoming msg.error payloads');
-  assert(contentCode.includes('catch (audioErr)'), 'setupComplete handler must catch initAudioCapture failures');
+  assert(contentCode.includes('audioErr'), 'setupComplete handler must catch initAudioCapture failures');
+  assert(contentCode.includes('setDiagnostics('), 'content.js must expose diagnostics for automated verification');
 });
 
-test('T3.6: Gemini Live Streaming Architecture, Macro Steering & Anti-Fragmentation', () => {
+test('T3.6: Native Live Translate Protocol, Session Rotation & Anti-Fragmentation Segmentation', () => {
   assert(contentCode.includes('function isLiveTranslateModel'), 'content.js must define isLiveTranslateModel');
   assert(contentCode.includes('function getBcp47LanguageCode'), 'content.js must define getBcp47LanguageCode');
-  assert(contentCode.includes('systemInstruction:'), 'content.js must support systemInstruction macro guidance');
+  assert(contentCode.includes('systemInstruction'), 'content.js must support systemInstruction macro guidance for Agent models');
   assert(contentCode.includes('outputAudioTranscription:'), 'content.js must request outputAudioTranscription');
   assert(contentCode.includes('sc.outputTranscription'), 'content.js must process outputTranscription');
-  assert(contentCode.includes('IS_STANDALONE_FILLER.test(trimmed)'), 'content.js must protect against filler fragments');
-  assert(contentCode.includes('ZH_UNFINISHED_TAIL.test(trimmed)'), 'content.js must protect against unfinished tails');
+  // 防碎片：新引擎采用「句末标点 + 静音 + 最大长度」三重断句，而非旧版尾部词表
+  assert(contentCode.includes('TERMINAL_PUNCT_RE'), 'content.js must define terminal punctuation boundary regex');
+  assert(contentCode.includes('function bufferEndsWithTerminal('), 'content.js must implement terminal-boundary detection');
+  assert(contentCode.includes('function maybeCommitByBoundary('), 'content.js must implement boundary-based commit');
+  assert(contentCode.includes("commitCurrentLine(false, 'punctuation')"), 'content.js must commit lines on sentence punctuation');
+  assert(contentCode.includes("'silence'"), 'content.js must commit lines on silence timeout');
+  assert(contentCode.includes('SESSION_ROTATE_MS'), 'content.js must implement proactive session rotation');
+  assert(contentCode.includes('standbySession'), 'content.js must support seamless standby rotation');
 
-  const bcpMatch = contentCode.match(/function getBcp47LanguageCode\([^\)]*\)\s*\{([\s\S]*?)\n  \}/);
-  assert(bcpMatch, 'getBcp47LanguageCode must be extracted');
-  const getBcp = new Function('targetLang', bcpMatch[1]);
-  assert.strictEqual(getBcp('中文普通话 (Chinese)'), 'zh');
-  assert.strictEqual(getBcp('日语 (Japanese)'), 'ja');
-  assert.strictEqual(getBcp('英语 (English)'), 'en');
+  // BCP-47 目标语言映射
+  assert.strictEqual(getBcp47LanguageCode('中文普通话 (Chinese)'), 'zh-Hans');
+  assert.strictEqual(getBcp47LanguageCode('繁体中文'), 'zh-Hant');
+  assert.strictEqual(getBcp47LanguageCode('日语 (Japanese)'), 'ja');
+  assert.strictEqual(getBcp47LanguageCode('英语 (English)'), 'en');
+  assert.strictEqual(getBcp47LanguageCode('韩语 (Korean)'), 'ko');
+
+  // 回归测试：translations/transcriptions 必须在 setup 顶层（官方文档 WebSocket 示例的 generationConfig 内层写法会被服务端 1007 拒绝）
+  const setupMatch = contentCode.match(/function buildSetupPayload\(\)\s*\{([\s\S]*?)\n  \}/);
+  assert(setupMatch, 'buildSetupPayload must be extractable');
+  const setupFactory = new Function(
+    'config', 'normalizeModelName', 'isLiveTranslateModel', 'getBcp47LanguageCode', 'buildDynamicSystemPrompt', 'getPageContext',
+    'return (' + setupMatch[0] + ');'
+  );
+  const buildSetup = setupFactory(
+    { model: 'models/gemini-3.5-live-translate-preview', targetLang: '中文普通话 (Chinese)', responseModality: 'AUDIO' },
+    (m) => 'models/' + String(m || '').replace(/^models\//i, ''),
+    (m) => /live-translate/i.test(String(m || '')),
+    (lang) => getBcp47LanguageCode(lang),
+    () => '',
+    () => ({ domain: 'GENERAL', title: '', channel: '' })
+  );
+  const payload = buildSetup();
+  assert(payload.setup.model === 'models/gemini-3.5-live-translate-preview', 'setup.model must be normalized with models/ prefix');
+  assert.deepStrictEqual(payload.setup.generationConfig.responseModalities, ['AUDIO'], 'Native live-translate must request AUDIO modality');
+  assert.strictEqual(payload.setup.generationConfig.inputAudioTranscription, undefined, 'inputAudioTranscription must NOT be nested in generationConfig');
+  assert.deepStrictEqual(payload.setup.inputAudioTranscription, {}, 'inputAudioTranscription must be a top-level setup field');
+  assert.deepStrictEqual(payload.setup.outputAudioTranscription, {}, 'outputAudioTranscription must be a top-level setup field');
+  assert.strictEqual(payload.setup.translationConfig, undefined, 'translationConfig must NOT be a top-level setup field (server rejects 1007)');
+  assert.strictEqual(payload.setup.generationConfig.translationConfig.targetLanguageCode, 'zh-Hans', 'translationConfig must live inside generationConfig with BCP-47 target');
+  assert.strictEqual(payload.setup.generationConfig.translationConfig.echoTargetLanguage, true, 'echoTargetLanguage must be enabled to caption same-language audio');
+  assert.strictEqual(payload.setup.systemInstruction, undefined, 'Native live-translate must not send systemInstruction');
+  assert.strictEqual(payload.setup.generationConfig.temperature, undefined, 'Native live-translate must not send temperature');
+  // 回归：contextWindowCompression 必须存在（缺失会导致长会话 70~90s 后产出塌缩）
+  assert(payload.setup.contextWindowCompression, 'Native setup must enable contextWindowCompression');
+  assert.deepStrictEqual(payload.setup.contextWindowCompression.slidingWindow, {}, 'contextWindowCompression must use slidingWindow');
+  assert.strictEqual(payload.setup.generationConfig.contextWindowCompression, undefined, 'contextWindowCompression must be a top-level setup field');
+
+  // legacy 兼容模式：供对照/回退使用，必须保留 systemInstruction 且不带 translationConfig
+  const legacyBuild = setupFactory(
+    { model: 'models/gemini-3.5-live-translate-preview', targetLang: '中文普通话 (Chinese)', responseModality: 'TEXT', protocolMode: 'legacy' },
+    (m) => 'models/' + String(m || '').replace(/^models\//i, ''),
+    (m) => /live-translate/i.test(String(m || '')),
+    (lang) => getBcp47LanguageCode(lang),
+    () => 'PROMPT',
+    () => ({ domain: 'GENERAL', title: '', channel: '' })
+  );
+  const legacyPayload = legacyBuild();
+  assert.strictEqual(legacyPayload.setup.generationConfig.translationConfig, undefined, 'legacy payload must NOT carry translationConfig');
+  assert.deepStrictEqual(legacyPayload.setup.generationConfig.responseModalities, ['TEXT'], 'legacy payload uses TEXT modality');
+  assert.strictEqual(legacyPayload.setup.generationConfig.temperature, 0.3, 'legacy payload keeps temperature for agent-style behavior');
+  assert(legacyPayload.setup.systemInstruction && legacyPayload.setup.systemInstruction.parts[0].text.includes('[MODE]'), 'legacy payload must carry systemInstruction macro steering');
+  assert.deepStrictEqual(legacyPayload.setup.inputAudioTranscription, {}, 'legacy payload keeps top-level transcription config');
 });
 
 test('T3.5: WebSocket URL Normalization & Key Parameter Formulation', () => {
@@ -500,6 +552,41 @@ test('T3.5: WebSocket URL Normalization & Key Parameter Formulation', () => {
   });
   assert(url2.startsWith('wss://custom-proxy.example.com/live/ws/google.ai.generativelanguage.'), 'Custom proxy URL must normalize https to wss');
   assert(!url2.includes('key='), 'Key parameter must not be appended if empty');
+});
+
+test('T3.7: Default Config Consistency & Audio Frame Format Builders', () => {
+  // content.js 默认配置
+  const cfgMatch = contentCode.match(/const DEFAULT_CONFIG = \{([\s\S]*?)\n  \};/);
+  assert(cfgMatch, 'content.js DEFAULT_CONFIG must be extractable');
+  const contentDefaults = new Function('return {' + cfgMatch[1] + '};')();
+  assert.strictEqual(contentDefaults.model, 'models/gemini-3.5-live-translate-preview', 'Default model must be the native live-translate model');
+  assert.strictEqual(contentDefaults.protocolMode, 'native', 'Default protocolMode must be native (verified continuous streaming)');
+  assert.strictEqual(contentDefaults.audioFrameStyle, 'mediaChunks', 'Default audioFrameStyle must be mediaChunks (verified continuous; realtimeInput.audio is sparse)');
+  assert.strictEqual(contentDefaults.responseModality, 'AUDIO', 'Default responseModality must be AUDIO for native live-translate');
+
+  // background.js 默认配置必须与 content.js 对齐（避免旧 storage 迁移后不一致）
+  const bgCfgMatch = bgCode.match(/const DEFAULT_CONFIG = \{([\s\S]*?)\n\};/);
+  assert(bgCfgMatch, 'background.js DEFAULT_CONFIG must be extractable');
+  const bgDefaults = new Function('return {' + bgCfgMatch[1] + '};')();
+  for (const key of ['model', 'protocolMode', 'audioFrameStyle', 'responseModality', 'targetLang', 'audioMode']) {
+    assert.strictEqual(bgDefaults[key], contentDefaults[key], `background.js DEFAULT_CONFIG.${key} must match content.js`);
+  }
+
+  // 音频帧构造器：mediaChunks（默认/实测有效）与 audio（官方字段/实测稀疏）可切换
+  const frameMatch = contentCode.match(/function buildAudioPayload\(b64Audio\)\s*\{([\s\S]*?)\n  \}/);
+  assert(frameMatch, 'buildAudioPayload must be extractable');
+  const buildFrame = new Function('config', 'b64Audio', frameMatch[1]);
+  const chunksFrame = buildFrame({ audioFrameStyle: 'mediaChunks' }, 'QUJD');
+  assert(chunksFrame.includes('"mediaChunks"'), 'mediaChunks frame must use realtimeInput.mediaChunks');
+  assert(chunksFrame.includes('"data":"QUJD"'), 'mediaChunks frame must carry base64 payload');
+  assert(chunksFrame.includes('audio/pcm;rate=16000'), 'mediaChunks frame must declare 16kHz PCM mime type');
+  const audioFrame = buildFrame({ audioFrameStyle: 'audio' }, 'QUJD');
+  assert(audioFrame.includes('"audio"') && !audioFrame.includes('mediaChunks'), 'audio frame mode must use realtimeInput.audio field');
+
+  // README 版本一致性
+  const readme = fs.readFileSync(path.join(ROOT_DIR, 'README.md'), 'utf8');
+  assert(readme.includes('v1.0.5'), 'README must document current version v1.0.5');
+  assert(readme.includes('mediaChunks'), 'README must document mediaChunks audio frame requirement');
 });
 
 // ============================================================================
@@ -600,15 +687,21 @@ test('T4.2: Shadow DOM Privacy Isolation Against Host QuerySelectors', () => {
 });
 
 test('T4.3: Zero-Reflow Streaming Subtitle Mutation via Persistent Text Nodes', () => {
-  const updateMatch = contentCode.match(/function updateActiveStreamingEntry\(\)\s*\{([\s\S]*?)\n  \}/);
-  assert(updateMatch, 'updateActiveStreamingEntry must be defined');
-  const body = updateMatch[1];
-  
-  assert(!body.includes('innerHTML'), 'updateActiveStreamingEntry must NOT use innerHTML');
-  assert(!body.includes('insertAdjacentHTML'), 'updateActiveStreamingEntry must NOT use insertAdjacentHTML');
-  assert(body.includes('_origText.nodeValue'), 'updateActiveStreamingEntry must mutate _origText.nodeValue directly');
-  assert(body.includes('_transText.nodeValue'), 'updateActiveStreamingEntry must mutate _transText.nodeValue directly');
-  assert(body.includes('safeScrollToBottom()'), 'updateActiveStreamingEntry must call safeScrollToBottom()');
+  const renderMatch = contentCode.match(/function renderStreamingLine\(\)\s*\{([\s\S]*?)\n  \}/);
+  assert(renderMatch, 'renderStreamingLine must be defined');
+  const body = renderMatch[1];
+
+  assert(!body.includes('innerHTML'), 'renderStreamingLine must NOT use innerHTML');
+  assert(!body.includes('insertAdjacentHTML'), 'renderStreamingLine must NOT use insertAdjacentHTML');
+  assert(body.includes('_origText.nodeValue'), 'renderStreamingLine must mutate _origText.nodeValue directly');
+  assert(body.includes('_transText.nodeValue'), 'renderStreamingLine must mutate _transText.nodeValue directly');
+  assert(body.includes('safeScrollToBottom()'), 'renderStreamingLine must call safeScrollToBottom()');
+
+  // 流式节点必须在首次渲染时创建并缓存引用（零查找）
+  const entryMatch = contentCode.match(/function ensureStreamingEntry\(\)\s*\{([\s\S]*?)\n  \}/);
+  assert(entryMatch, 'ensureStreamingEntry must be defined');
+  assert(entryMatch[1].includes('document.createTextNode'), 'ensureStreamingEntry must create persistent Text nodes');
+  assert(entryMatch[1].includes('entry._transText = transTextNode'), 'ensureStreamingEntry must cache text node references on the entry');
 });
 
 test('T4.4: rAF Scroll Batching & Anti-Scroll-Jacking Protection', () => {
@@ -628,10 +721,10 @@ test('T4.5: CSS Custom Properties on Root & Zero DOM Querying in Sliders', () =>
   assert(cssCode.includes('--g-sub-font-size: 17px;'), 'content.css must define default --g-sub-font-size');
   assert(cssCode.includes('var(--g-sub-font-size, 17px)'), 'content.css .g-sub-trans must consume --g-sub-font-size');
 
-  const sliderBlock = contentCode.substring(
-    contentCode.indexOf('opacitySlider.addEventListener'),
-    contentCode.indexOf('let saveConfigTimer')
-  );
+  const sliderStart = contentCode.indexOf('opacitySlider.addEventListener');
+  const sliderEnd = contentCode.indexOf('displayModeSelect.addEventListener');
+  assert(sliderStart > 0 && sliderEnd > sliderStart, 'slider listeners block must be locatable');
+  const sliderBlock = contentCode.substring(sliderStart, sliderEnd);
   assert(sliderBlock.includes('--g-sub-opacity'), 'opacity slider must set --g-sub-opacity');
   assert(sliderBlock.includes('--g-sub-blur'), 'blur slider must set --g-sub-blur');
   assert(sliderBlock.includes('--g-sub-font-size'), 'font-size slider must set --g-sub-font-size');
@@ -655,9 +748,9 @@ test('T4.7: Event Retargeting & Fullscreen Reparenting Mechanics', () => {
 });
 
 // ============================================================================
-// TIER 5: SECURITY, SANITIZATION & FAST LANGUAGE DRIFT
+// TIER 5: SECURITY, SANITIZATION & LANGUAGE MAPPING
 // ============================================================================
-startTier('TIER 5', 'Security, Sanitization & Fast Language Drift (Redaction, OWASP, Fast Path)');
+startTier('TIER 5', 'Security, Sanitization & BCP-47 Language Mapping (Redaction, OWASP, Fast Path)');
 
 test('T5.1: Zero Plaintext API Key Leakage Across All Traces', () => {
   const secretKey = 'AIzaSyD_CONFIDENTIAL_KEY_999888777';
@@ -745,27 +838,27 @@ test('T5.3: Adversarial Fuzzing: 1,600+ XSS / DOM Breakout Payloads on escapeHtm
   assert.strictEqual(unescapedAmpersandsCount, 0, `Encountered ${unescapedAmpersandsCount} unescaped ampersands during fuzzing`);
 });
 
-test('T5.4: Single-Pass Zero-Allocation charCodeAt Language Drift Detection', () => {
-  // Target: Simplified Chinese (zh)
-  assert.strictEqual(isLanguageDrifted('これは日本語の音声です', 'zh'), true, 'Japanese kana must drift in zh target');
-  assert.strictEqual(isLanguageDrifted('テスト文章', 'zh'), true, 'Katakana must drift in zh target');
-  assert.strictEqual(isLanguageDrifted('\uC548\uB155\uD558\uC138\uC694', 'zh'), true, 'Hangul must drift in zh target');
-  assert.strictEqual(isLanguageDrifted('This is an English sentence without Chinese', 'zh'), true, 'Dominant English must drift in zh target');
-  assert.strictEqual(isLanguageDrifted('今天的天气非常晴朗，阳光明媚。', 'zh'), false, 'Chinese text must not drift in zh target');
-  assert.strictEqual(isLanguageDrifted('使用 WebAudio API 进行 16kHz PCM 音频采样', 'zh'), false, 'Chinese with technical loanwords must not drift in zh target');
-  assert.strictEqual(isLanguageDrifted('测试CJK扩展A区字符：㐀㐁㐂㐃以及䶰䶱䶲', 'zh'), false, 'CJK Extension A characters must not drift in zh target');
+test('T5.4: BCP-47 Language Mapping & Native Model Family Detection', () => {
+  // 目标语言 → 官方 Live Translate 支持的 BCP-47 码
+  assert.strictEqual(getBcp47LanguageCode('中文普通话 (Chinese)'), 'zh-Hans');
+  assert.strictEqual(getBcp47LanguageCode('中文 (Chinese)'), 'zh-Hans');
+  assert.strictEqual(getBcp47LanguageCode('繁体中文'), 'zh-Hant');
+  assert.strictEqual(getBcp47LanguageCode('日语 (Japanese)'), 'ja');
+  assert.strictEqual(getBcp47LanguageCode('英语 (English)'), 'en');
+  assert.strictEqual(getBcp47LanguageCode('韩语 (Korean)'), 'ko');
+  assert.strictEqual(getBcp47LanguageCode('西班牙语'), 'es');
+  assert.strictEqual(getBcp47LanguageCode('法语'), 'fr');
+  assert.strictEqual(getBcp47LanguageCode('德语'), 'de');
+  assert.strictEqual(getBcp47LanguageCode('俄语'), 'ru');
+  assert.strictEqual(getBcp47LanguageCode('葡萄牙语'), 'pt-BR');
+  assert.strictEqual(getBcp47LanguageCode('未知语言'), 'zh-Hans', 'Unknown target must fall back to zh-Hans');
 
-  // Target: English (en)
-  assert.strictEqual(isLanguageDrifted('Hello 世界', 'en'), true, 'Chinese character must drift in en target');
-  assert.strictEqual(isLanguageDrifted('ありがとう', 'en'), true, 'Kana must drift in en target');
-  assert.strictEqual(isLanguageDrifted('\uAC10\uC0AC\uD569\uB2C8\uB2E4', 'en'), true, 'Hangul must drift in en target');
-  assert.strictEqual(isLanguageDrifted('This is a completely valid English subtitle.', 'en'), false, 'English must not drift in en target');
-
-  // Target: Japanese (ja)
-  assert.strictEqual(isLanguageDrifted('\uC548\uB155\uD558\uC138\uC694', 'ja'), true, 'Hangul must drift in ja target');
-  assert.strictEqual(isLanguageDrifted('This is purely English text.', 'ja'), true, 'Pure English must drift in ja target');
-  assert.strictEqual(isLanguageDrifted('本日は晴天なり。素晴らしい一日ですね。', 'ja'), false, 'Japanese Kanji/Kana must not drift in ja target');
-  assert.strictEqual(isLanguageDrifted('Pythonのasyncioライブラリを使った開発', 'ja'), false, 'Japanese with English loanword must not drift in ja target');
+  // 模型族判定：决定 setup 载荷走原生同传还是 Agent 语境模式
+  assert.strictEqual(isLiveTranslateModel('models/gemini-3.5-live-translate-preview'), true);
+  assert.strictEqual(isLiveTranslateModel('gemini-3.5-live-translate-preview'), true);
+  assert.strictEqual(isLiveTranslateModel('models/gemini-3.1-flash-live-preview'), false);
+  assert.strictEqual(isLiveTranslateModel(''), false);
+  assert.strictEqual(isLiveTranslateModel(null), false);
 });
 
 test('T5.5: Fast detectLanguageFromText Heuristic Classification Accuracy', () => {
@@ -777,26 +870,26 @@ test('T5.5: Fast detectLanguageFromText Heuristic Classification Accuracy', () =
   assert.strictEqual(detectLanguageFromText(null), 'auto', 'Null input returns auto');
 });
 
-// Benchmark: Language Drift Detection & Sanitization Ops/Sec
+// Benchmark: Language Detection & Sanitization Ops/Sec
 (() => {
   const ITERS = 100000;
-  const sampleZh = '这是一个用于性能基准测试的中文字符串，包含 WebAudio 和 WebSocket 专有名词。';
+  const sampleJa = 'これは日本語の音声をリアルタイムで中国語に翻訳するテストです。';
   const sampleClean = 'Clean string for escapeHtml fast path latency benchmarking.';
   const sampleDirty = 'Dirty string with <script>alert("xss")</script> & \'quotes\' and `backticks`.';
 
-  // 1. Language Drift Throughput
+  // 1. Language Detection Throughput
   const t0 = performance.now();
   let dummyCount = 0;
   for (let i = 0; i < ITERS; i++) {
-    const drifted = isLanguageDrifted(sampleZh, 'zh');
-    if (!drifted) dummyCount++;
+    const lang = detectLanguageFromText(sampleJa);
+    if (lang === 'ja') dummyCount++;
   }
   const elapsedDrift = performance.now() - t0;
   const driftOpsPerSec = Math.round((ITERS / (elapsedDrift / 1000)));
   const driftLatencyUs = ((elapsedDrift / ITERS) * 1000).toFixed(3);
 
   benchmarkResults.push({
-    name: 'Language Drift Detection (isLanguageDrifted charCodeAt)',
+    name: 'Language Detection (detectLanguageFromText charCodeAt)',
     metric: `${driftOpsPerSec.toLocaleString()} ops/sec (${driftLatencyUs} µs/op)`,
     duration: `${elapsedDrift.toFixed(2)} ms for ${ITERS.toLocaleString()} calls`
   });

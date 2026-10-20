@@ -1,49 +1,82 @@
 /**
- * Gemini Live Translator - Chrome Extension Content Script (Release Edition)
- * Modular Multi-Domain Context-Aware Translation Engine with Verse-Level Metric Lyric & Speech Segmentation
+ * Gemini Live Translator - Chrome Extension Content Script (v2 Engine)
+ * ---------------------------------------------------------------------
+ * 实时双语同传字幕引擎（原生 Gemini 3.5 Live Translate 协议）
+ *
+ * 架构：
+ *   1) 会话状态机（CONNECTING / READY / STREAMING / RECONNECTING / STOPPED）
+ *      - 握手超时按网关实测放宽到 30s
+ *      - 指数退避重连（上限 8s），永不因网关临时错误误判为致命错误
+ *      - 看门狗：有声音但长时间无转写 / 服务端长时间静默 → 主动重建会话
+ *      - 9 分钟预防性「无缝轮转」：新旧会话交接，字幕不断档
+ *   2) 音频引擎：<video> / 麦克风 → AudioContext → 流式线性插值重采样到
+ *      16kHz/16bit/单声道 → 精确 100ms 分块 → Base64 → realtimeInput
+ *   3) 字幕引擎：inputTranscription（原文）+ outputTranscription（译文）
+ *      增量合并 → 标点/静音边界断句 → Shadow DOM 零重排渲染
+ *   4) 浮窗 UI：拖拽/缩放/透明度/字号/显示模式/音源切换/语境菜单
  */
 
 (function () {
-  if (window.__geminiLiveTranslatorLoaded) return;
+  'use strict';
+
+  if (window.__geminiLiveTranslatorLoaded) {
+    // 兼容扩展热重载：清掉上一个（可能已失效的）实例残留的宿主节点
+    try {
+      const stale = document.getElementById('gemini-live-translator-host');
+      if (stale) stale.remove();
+    } catch (e) {}
+    return;
+  }
   window.__geminiLiveTranslatorLoaded = true;
 
-  // Default Settings State
-  let config = {
+  // ========================================================================
+  // 0. 常量与默认配置
+  // ========================================================================
+
+  const DEFAULT_CONFIG = {
     apiHost: 'https://generativelanguage.googleapis.com',
     apiKey: '',
     model: 'models/gemini-3.5-live-translate-preview',
     sourceLang: '自动识别 (Auto Detect)',
     targetLang: '中文普通话 (Chinese)',
-    forcedDomain: 'GENERAL', // 'GENERAL' (default), 'CINEMA', 'VTUBER', 'TECH_LECTURE', 'GAMING', 'auto'
+    forcedDomain: 'GENERAL',
+    displayMode: 'bilingual', // 'bilingual' | 'trans' | 'orig'
     fontSize: 17,
     opacity: 0.65,
     blur: 3,
-    audioMode: 'video',
+    audioMode: 'video', // 'video' | 'mic'
+    audioFrameStyle: 'mediaChunks', // 'mediaChunks'（实测连续同传）| 'audio'（官方文档字段，实测稀疏）
+    protocolMode: 'native', // 'native'（官方 translationConfig，实测连续+实时）| 'legacy'（旧 Agent 兼容载荷）
+    responseModality: 'AUDIO', // 原生同传模型：AUDIO（官方推荐，实测低延迟）| TEXT（仅字幕）
     width: 760,
     height: 300,
     pos: null
   };
 
-  // Runtime State
-  let isRunning = false;
-  let detectedSourceLang = 'auto';
-  let activeDomain = 'GENERAL';
-  let ws = null;
-  let audioCtx = null;
-  let audioSourceNode = null;
-  let processorNode = null;
-  let analyserNode = null;
-  let mutedGainNode = null;
-  let mediaStream = null;
-  let currentBoundVideo = null;
-  let reconnectAttempts = 0;
-  let reconnectTimer = null;
-  let isManualDisconnect = false;
-  const MAX_RECONNECT_ATTEMPTS = 5;
+  const MODEL_TRANSLATE = 'models/gemini-3.5-live-translate-preview';
+
+  // 握手/重连/轮转参数（依据网关实测 0.5s~13.5s 握手波动放宽）
+  const CONNECT_TIMEOUT_MS = 30000;
+  const RECONNECT_BASE_MS = 600;
+  const RECONNECT_MAX_MS = 8000;
+  const RECONNECT_MAX_ATTEMPTS_BEFORE_WARN = 20;
+  const SERVER_SILENCE_RECONNECT_MS = 45000;
+  // 实测网关 5-Key 轮换会随机绑定质量不一的上游 Key：同一配置 120s 内产出可能在 2~118 条之间波动，
+  // 表现为"有时能用、有时翻两句就停、重连又好了"。看门狗在有语音却长时间无转写/无译文时主动重连换 Key。
+  const NO_TRANSCRIPTION_RECONNECT_MS = 18000;
+  const NO_TRANSLATION_RECONNECT_MS = 20000;
+  const SESSION_ROTATE_MS = 9 * 60 * 1000;
+  const AUDIO_CHUNK_SAMPLES = 1600; // 100ms @16kHz
+  const AUDIO_MAX_QUEUE_CHUNKS = 30; // 握手期间最多缓存 3s 音频
+
+  let config = Object.assign({}, DEFAULT_CONFIG);
+
+  // ========================================================================
+  // 1. 通用工具
+  // ========================================================================
 
   /**
-   * Zero API Key Leakage & Privacy Protection Helper
-   * Strips API keys and tokens from all error messages, URL traces, and exception dumps.
+   * 脱敏：从任意错误信息 / URL 中抹掉 API Key。
    */
   function sanitizeErrorMessage(err) {
     if (err === null || err === undefined) return '';
@@ -56,67 +89,34 @@
     return String(url).replace(/([?&]key=)[^&\s'"]+/gi, '$1***REDACTED***');
   }
 
-  function isLiveTranslateModel(model) {
-    return typeof model === 'string' && model.includes('live-translate');
-  }
-
-  function getBcp47LanguageCode(targetLang) {
-    const t = (targetLang || '').toLowerCase();
-    if (t.includes('中文') || t.includes('chinese') || t.includes('zh')) return 'zh';
-    if (t.includes('日语') || t.includes('japanese') || t.includes('ja')) return 'ja';
-    if (t.includes('英语') || t.includes('english') || t.includes('en')) return 'en';
-    if (t.includes('韩语') || t.includes('korean') || t.includes('ko')) return 'ko';
-    if (t.includes('西班') || t.includes('spanish') || t.includes('es')) return 'es';
-    if (t.includes('法') || t.includes('french') || t.includes('fr')) return 'fr';
-    if (t.includes('德') || t.includes('german') || t.includes('de')) return 'de';
-    if (t.includes('俄') || t.includes('russian') || t.includes('ru')) return 'ru';
-    return 'zh';
+  function now() {
+    return Date.now();
   }
 
   /**
-   * Exponential Backoff with Jitter:
-   * delay = Math.min(1000 * 2^attempt * (0.8 + Math.random() * 0.4), 16000)
+   * 指数退避 + 抖动：600ms,1.2s,2.4s,4.8s,8s（上限 8s，±20% 抖动）。
+   * 常量内联以便单测可独立求值。
    */
   function calculateBackoffDelay(attempt) {
-    const base = 1000 * Math.pow(2, attempt);
+    const base = 600 * Math.pow(2, Math.max(0, attempt));
     const jitter = 0.8 + Math.random() * 0.4;
-    return Math.min(Math.round(base * jitter), 16000);
+    return Math.min(Math.round(base * jitter), 8000);
   }
 
   /**
-   * Differentiates terminal fatal errors (invalid key, 401/403, 1008 policy violation)
-   * from transient network drops.
+   * 判断错误是否为「不可恢复的配置错误」。
+   * 注意：走自定义网关时，网关注入的 Key 由服务端轮换，客户端占位 Key 本身无效，
+   * 因此 4xx 也不能直接判定为客户端配置错误 —— 只把明确的 Key 无效类报文当致命。
    */
   function isTerminalError(code, reasonOrMessage) {
-    if (code === 1008 || code === 4400 || code === 4401 || code === 4403 || (code >= 4000 && code <= 4999)) {
-      return true;
-    }
-    if (code === 400 || code === 401 || code === 403 || code === 404) {
-      return true;
-    }
     const str = String(reasonOrMessage || '');
-    return /API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED|API key not valid|RESOURCE_EXHAUSTED|Quota exceeded|BILLING_DISABLED/i.test(str);
+    if (/API key not valid|API_KEY_INVALID|API key expired|CONSUMER_INVALID/i.test(str)) return true;
+    if (code === 401 || code === 403) {
+      return /API_KEY_INVALID|API key not valid|PERMISSION_DENIED|UNAUTHENTICATED/i.test(str);
+    }
+    return false;
   }
 
-  // Web Audio Source Cache (WeakMap prevents GC leaks and InvalidStateError)
-  const mediaSourceCache = new WeakMap();
-
-  // Pre-allocated Static Audio Buffers for Zero-GC Downsampling
-  const MAX_PCM_SAMPLES = 4096;
-  const reusablePcm16 = new Int16Array(MAX_PCM_SAMPLES);
-  const reusableUint8 = new Uint8Array(reusablePcm16.buffer);
-  
-  // Subtitle Sentence Aggregation Buffers
-  let currentStreamingEntry = null;
-  let currentOrigBuffer = '';
-  let currentTransBuffer = '';
-  let lastAudioTime = Date.now();
-  let silenceFlushTimer = null;
-  let isUserScrolledUp = false;
-  let volumeCheckInterval = null;
-  let connectTimeoutTimer = null;
-
-  // Language Detection Heuristic Helper (Zero-Allocation charCodeAt single pass)
   function detectLanguageFromText(text) {
     if (!text || typeof text !== 'string') return 'auto';
     let kanaCount = 0;
@@ -129,10 +129,10 @@
       const code = text.charCodeAt(i);
       if (code >= 0x3040 && code <= 0x30FF) {
         kanaCount++;
-        if (kanaCount >= 2) return 'ja'; // Fast early-exit for Japanese
+        if (kanaCount >= 2) return 'ja';
       } else if ((code >= 0xAC00 && code <= 0xD7AF) || (code >= 0x1100 && code <= 0x11FF) || (code >= 0x3130 && code <= 0x318F)) {
         hangulCount++;
-        if (hangulCount >= 2) return 'ko'; // Fast early-exit for Korean
+        if (hangulCount >= 2) return 'ko';
       } else if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF)) {
         cjkCount++;
       } else if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
@@ -147,30 +147,275 @@
     return 'auto';
   }
 
-  // Load saved settings
-  if (chrome.storage && chrome.storage.local) {
-    chrome.storage.local.get(['geminiLiveConfig'], (res) => {
-      if (res.geminiLiveConfig) {
-        config = { ...config, ...res.geminiLiveConfig };
-        applyInitialStyles();
-      }
-    });
+  const HTML_ESCAPE_MAP = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+    '`': '&#96;'
+  };
+  const HTML_ESCAPE_REGEX = /[&<>"'`]/g;
+
+  function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    const s = typeof str === 'string' ? str : String(str);
+    if (!HTML_ESCAPE_REGEX.test(s)) return s;
+    return s.replace(HTML_ESCAPE_REGEX, (ch) => HTML_ESCAPE_MAP[ch]);
   }
 
-  // 1. Create Shadow Host Element & Open ShadowRoot
+  /**
+   * 目标语言 → BCP-47 语言码（官方 Live Translate 使用 zh-Hans / zh-Hant 等）
+   */
+  function getBcp47LanguageCode(targetLang) {
+    const t = String(targetLang || '').toLowerCase();
+    if (t.includes('中文') || t.includes('chinese') || t.includes('zh')) {
+      if (t.includes('繁體') || t.includes('繁体') || t.includes('traditional') || t.includes('zh-tw') || t.includes('zh-hant')) return 'zh-Hant';
+      return 'zh-Hans';
+    }
+    const map = [
+      [/(日语|日語|japanese|日本語|\bja\b)/, 'ja'],
+      [/(英语|english|\ben\b)/, 'en'],
+      [/(韩语|韓語|korean|한국어|\bko\b)/, 'ko'],
+      [/(西班|spanish|\bes\b)/, 'es'],
+      [/(法語|法语|french|\bfr\b)/, 'fr'],
+      [/(德語|德语|german|\bde\b)/, 'de'],
+      [/(俄語|俄语|russian|\bru\b)/, 'ru'],
+      [/(葡萄牙|portuguese|\bpt\b)/, 'pt-BR'],
+      [/(義大利|意大利|italian|\bit\b)/, 'it'],
+      [/(越南|vietnamese|\bvi\b)/, 'vi'],
+      [/(泰語|泰语|thai|\bth\b)/, 'th'],
+      [/(印尼|indonesian|\bid\b)/, 'id'],
+      [/(阿拉伯|arabic|\bar\b)/, 'ar'],
+      [/(印地|hindi|\bhi\b)/, 'hi'],
+      [/(土耳其|turkish|\btr\b)/, 'tr']
+    ];
+    for (let i = 0; i < map.length; i++) {
+      if (map[i][0].test(t)) return map[i][1];
+    }
+    return 'zh-Hans';
+  }
+
+  function isLiveTranslateModel(model) {
+    return typeof model === 'string' && /live-translate/i.test(model);
+  }
+
+  function normalizeModelName(model) {
+    let s = String(model || '').trim() || MODEL_TRANSLATE;
+    s = s.replace(/^models\//i, '');
+    return 'models/' + s;
+  }
+
+  // ========================================================================
+  // 2. 运行时状态
+  // ========================================================================
+
+  let isRunning = false;          // 用户是否希望服务运行（意图）
+  let detectedSourceLang = 'auto';
+  let activeDomain = 'GENERAL';
+
+  // 会话
+  let sessionSeq = 0;
+  let activeSession = null;       // 当前正在接收音频的会话
+  let standbySession = null;      // 预防性轮转时正在握手的新会话
+  let reconnectTimer = null;
+  let reconnectAttempts = 0;
+  let watchdogTimer = null;
+  let sessionStartTimer = null;
+
+  // 音频
+  let audioCtx = null;
+  let persistentAudioCtx = null;
+  let audioSourceNode = null;
+  let processorNode = null;
+  let analyserNode = null;
+  let mutedGainNode = null;
+  let mediaStream = null;
+  let currentBoundVideo = null;
+  let mediaSourceCache = new WeakMap();
+  let audioPipelineReady = false;
+  let audioChunksSent = 0;
+  let lastAudioSentAt = 0;
+  let lastSpeechAt = 0;
+  let audioResumeTimer = null;
+  let volumeLevel = 0;
+  let volumeCheckInterval = null;
+  let droppedAudioChunks = 0;
+  let videoWaitTimer = null;
+  let inlineAudioChunks = 0;
+  let isVideoPaused = false;
+
+  // 流式重采样器状态（跨 block 保持相位，避免块间漂移）
+  const resampler = {
+    carry: new Float32Array(2),
+    carryCount: 0,
+    phase: 0,
+    step: 3,
+    pending: new Int16Array(AUDIO_CHUNK_SAMPLES * 4),
+    pendingCount: 0,
+    outScratch: new Float32Array(8192)
+  };
+
+  // 字幕
+  let currentStreamingEntry = null;
+  let currentOrigBuffer = '';
+  let currentTransBuffer = '';
+  let committedLines = 0;
+  let lastTranscriptionAt = 0;
+  let lastServerMessageAt = 0;
+  let silenceFlushTimer = null;
+  let commitGraceTimer = null;
+  let pendingCommitReason = '';
+
+  // UI
+  let isUserScrolledUp = false;
+  let isDragging = false;
+  const dragOffset = { x: 0, y: 0 };
+  let isConnectingUI = false;
+
+  // ========================================================================
+  // 3. 语言规则与语境提示词（仅 Agent 模型使用）
+  // ========================================================================
+
+  function getTargetLanguageRule(targetLang) {
+    const t = String(targetLang || '').toLowerCase();
+    if (t.includes('英语') || t.includes('english') || /\ben\b/.test(t)) {
+      return {
+        id: 'en',
+        name: 'English',
+        systemPrompt: '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.\nTARGET LANGUAGE: Strictly English.\nOutput ONLY natural English translations of the incoming speech. Never output Chinese characters or Japanese Kana.',
+        driftWarning: '[Language Drift]: Target language is English. Output all translations in English only!'
+      };
+    }
+    if (t.includes('日语') || t.includes('日語') || t.includes('japanese') || /\bja\b/.test(t)) {
+      return {
+        id: 'ja',
+        name: '日本語',
+        systemPrompt: '[CRITICAL DIRECTIVE]: あなたはリアルタイム同時通訳システムです。\nTARGET LANGUAGE: 日本語。\n入力音声を自然で流暢な日本語に翻訳し、翻訳結果のテキストのみを出力してください。',
+        driftWarning: '【言語修正】：ターゲット言語は日本語です。翻訳結果はすべて日本語で出力してください。'
+      };
+    }
+    return {
+      id: 'zh',
+      name: '简体中文',
+      systemPrompt: '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.\nTARGET LANGUAGE: Strictly Simplified Chinese (简体中文).\nTranslate all incoming speech into natural Simplified Chinese. Never output English or Japanese transcriptions; output only the translated Chinese text.',
+      driftWarning: '【语言修正】：目标语言是简体中文，请将音频全部同传为简体中文输出。'
+    };
+  }
+
+  function getPageContext() {
+    let title = document.title || '';
+    title = title.replace(/\s*-\s*YouTube$/i, '').replace(/\s*-\s*Twitch$/i, '').replace(/\s*_\s*哔哩哔哩_bilibili$/i, '').trim();
+
+    let channelName = '';
+    const channelEl = document.querySelector('#owner #channel-name a, ytd-channel-name a, #upload-info #channel-name a, [data-a-target="user-channel-link"], .up-name, .username, .up-info--right .name');
+    if (channelEl) channelName = channelEl.textContent.trim();
+
+    let metaTags = '';
+    const tagMeta = document.querySelectorAll('meta[property="og:video:tag"], meta[name="keywords"], meta[property="og:title"]');
+    tagMeta.forEach((m) => { if (m.content) metaTags += ' ' + m.content; });
+
+    const labels = {
+      CINEMA: '🎬 影视 / 动漫与剧场',
+      VTUBER: '🎙️ VTuber / 圈内与歌回',
+      TECH_LECTURE: '🎓 科技 / 学术演讲',
+      GAMING: '🎮 游戏实况 / 电竞',
+      GENERAL: '🌐 综合通用模式'
+    };
+
+    if (config.forcedDomain && config.forcedDomain !== 'auto') {
+      return {
+        title: title.slice(0, 150),
+        channel: channelName.slice(0, 80),
+        domain: config.forcedDomain,
+        domainLabel: labels[config.forcedDomain] || '🏷️ 自定义模式'
+      };
+    }
+
+    const titleLower = title.toLowerCase();
+    const channelLower = channelName.toLowerCase();
+    const metaLower = metaTags.toLowerCase();
+    const fullText = `${titleLower} ${channelLower} ${metaLower}`;
+
+    const scores = { CINEMA: 0, VTUBER: 0, TECH_LECTURE: 0, GAMING: 0 };
+
+    if (/gaming|游戏|单机游戏|网游/.test(metaLower)) scores.GAMING += 30;
+    if (/film & animation|anime|bangumi|番剧|动画|影视|电影/.test(metaLower)) scores.CINEMA += 30;
+    if (/education|science & technology|知识|公开课|科技/.test(metaLower)) scores.TECH_LECTURE += 30;
+    if (/just chatting|virtual youtuber|雑談/.test(metaLower)) scores.VTUBER += 30;
+
+    const formatPatterns = {
+      VTUBER: ['vtuber', 'vstreamer', 'バーチャル', '生配信', '雑談', '歌枠', '歌雑', '凸待ち', '切り抜き', 'virtual youtuber', 'v-tuber', 'sub ch', 'ラジオ', '生放送', '新衣装', 'コラボ', 'collab', '企画', '耐久', '朝活', '夜活', 'ライバー', 'liver'],
+      CINEMA: ['anime', 'animation', 'theatrical', 'ova', 'ona', 'movie', 'film', 'cinema', 'drama', 'series', 'season', 'trailer', 'teaser', 'アニメ', '劇場版', '映画', 'ドラマ', '番剧', '新番', '剧场版', '动画', '声優', '配音', '中字', '字幕', '预告片', '予告', '本編', '正片', '全集', '吹き替え'],
+      TECH_LECTURE: ['keynote', 'symposium', 'colloquium', 'lecture', 'seminar', 'conference', 'presentation', 'tutorial', 'course', 'workshop', 'ted', 'tedx', 'panel discussion', 'roundtable', 'fireside chat', 'interview', 'debate', 'documentary', '公开课', '学术报告', '研讨会', '讲座', '论坛', '教程', '访谈', '学术', '演讲'],
+      GAMING: ['gameplay', 'walkthrough', 'playthrough', 'speedrun', 'esports', "let's play", 'boss fight', '実況', 'ゲーム実況', 'ゲーム配信', 'ゲームプレイ', 'プレイ動画', '初見', '縛りプレイ', 'クリア', '游戏实况', '实况解说', '通关攻略', '对决', '试玩']
+    };
+
+    if (/第\s*\d+\s*[話话集期]|ep\s*\d+|全\s*\d+\s*[話话集]|#\s*\d+/i.test(titleLower)) scores.CINEMA += 25;
+
+    Object.keys(formatPatterns).forEach((domainKey) => {
+      formatPatterns[domainKey].forEach((term) => {
+        if (titleLower.includes(term) || channelLower.includes(term)) scores[domainKey] += 20;
+        else if (metaLower.includes(term)) scores[domainKey] += 10;
+      });
+    });
+
+    let maxDomain = 'GENERAL';
+    let maxScore = 0;
+    Object.keys(scores).forEach((domainKey) => {
+      if (scores[domainKey] > maxScore) {
+        maxScore = scores[domainKey];
+        maxDomain = domainKey;
+      }
+    });
+    if (maxScore < 8) maxDomain = 'GENERAL';
+
+    return {
+      title: title.slice(0, 150),
+      channel: channelName.slice(0, 80),
+      domain: maxDomain,
+      domainLabel: labels[maxDomain]
+    };
+  }
+
+  function buildDynamicSystemPrompt(pageCtx) {
+    const srcLangDesc = String(config.sourceLang || '').includes('自动') ? '自动识别' : config.sourceLang;
+    const tgtRule = getTargetLanguageRule(config.targetLang);
+    let domainModule = '';
+    switch (pageCtx.domain) {
+      case 'CINEMA':
+        domainModule = '【场景：影视/动漫】地道生动的影视译制风格，多角色对白清晰独立，忽略环境拟音与背景音乐。';
+        break;
+      case 'VTUBER':
+        domainModule = '【场景：VTuber/直播】口语自然亲切，准确传达主播语气、情绪与观众互动氛围。';
+        break;
+      case 'TECH_LECTURE':
+        domainModule = '【场景：科技/学术演讲】严谨准确、逻辑清晰，完整保留复合长句与专业术语。';
+        break;
+      case 'GAMING':
+        domainModule = '【场景：游戏实况/电竞】节奏明快，准确翻译操作术语、战术沟通与临场反应。';
+        break;
+      default:
+        domainModule = '【场景：通用】流畅通顺、通俗自然，准确传达原意与语气。';
+    }
+    return `${tgtRule.systemPrompt}\n\n【视频参考背景】\n- 标题：${pageCtx.title || '无'}\n- 频道：${pageCtx.channel || '无'}\n- 源语言：${srcLangDesc}\n- 目标语言：${tgtRule.name}\n${domainModule}`;
+  }
+
+  // ========================================================================
+  // 4. Shadow DOM 浮窗 UI
+  // ========================================================================
+
   const hostEl = document.createElement('div');
   hostEl.id = 'gemini-live-translator-host';
   hostEl.style.cssText = 'all: initial !important; position: absolute !important; top: 0 !important; left: 0 !important; width: 0 !important; height: 0 !important; overflow: visible !important; z-index: 2147483647 !important; pointer-events: none !important;';
 
   const shadowRoot = hostEl.attachShadow({ mode: 'open' });
 
-  // Adopt content.css Inside ShadowRoot
   const styleLink = document.createElement('link');
   styleLink.rel = 'stylesheet';
   styleLink.href = chrome.runtime ? chrome.runtime.getURL('content.css') : 'content.css';
   shadowRoot.appendChild(styleLink);
 
-  // Floating Overlay DOM inside ShadowRoot
   const overlay = document.createElement('div');
   overlay.id = 'gemini-live-sub-overlay';
   overlay.style.display = 'none';
@@ -214,30 +459,26 @@
       </div>
     </div>
 
-    <!-- Live Settings Dropdown Panel -->
     <div class="g-sub-settings-panel" id="gSubSettingsPanel">
       <div class="g-sub-setting-row">
-        <div class="g-sub-setting-label">
-          <span>窗口不透明度</span>
-          <span id="gSubOpacityVal">65%</span>
-        </div>
+        <div class="g-sub-setting-label"><span>窗口不透明度</span><span id="gSubOpacityVal">65%</span></div>
         <input type="range" id="gSubOpacitySlider" min="10" max="100" value="65" class="g-sub-setting-slider">
       </div>
-
       <div class="g-sub-setting-row">
-        <div class="g-sub-setting-label">
-          <span>背景毛玻璃模糊度</span>
-          <span id="gSubBlurVal">3px</span>
-        </div>
+        <div class="g-sub-setting-label"><span>背景毛玻璃模糊度</span><span id="gSubBlurVal">3px</span></div>
         <input type="range" id="gSubBlurSlider" min="0" max="20" value="3" class="g-sub-setting-slider">
       </div>
-
       <div class="g-sub-setting-row">
-        <div class="g-sub-setting-label">
-          <span>译文字号大小</span>
-          <span id="gSubFontSizeVal">17px</span>
-        </div>
+        <div class="g-sub-setting-label"><span>译文字号大小</span><span id="gSubFontSizeVal">17px</span></div>
         <input type="range" id="gSubFontSizeSlider" min="12" max="30" value="17" class="g-sub-setting-slider">
+      </div>
+      <div class="g-sub-setting-row">
+        <div class="g-sub-setting-label"><span>字幕显示模式</span><span></span></div>
+        <select class="g-sub-setting-select" id="gSubDisplayMode">
+          <option value="bilingual">双语（原文 + 译文）</option>
+          <option value="trans">仅译文</option>
+          <option value="orig">仅原文</option>
+        </select>
       </div>
     </div>
 
@@ -248,15 +489,17 @@
     </div>
 
     <div class="g-sub-status-bar">
-      <div style="display: flex; align-items: center; gap: 8px;">
+      <div class="g-sub-status-left">
+        <span class="g-sub-conn-dot" id="gSubConnDot"></span>
         <span id="gSubStatusText">就绪</span>
+        <span class="g-sub-vol-wrap" id="gSubVolWrap" title="输入音量"><span class="g-sub-vol-fill" id="gSubVolFill"></span></span>
         <button class="g-sub-domain-btn" id="gSubDomainBtn" title="点击手动切换翻译语境模式">
           <span id="gSubDomainText">🌐 综合通用模式</span> ▾
         </button>
+        <span class="g-sub-engine" id="gSubEngineText">原生同传</span>
       </div>
       <button class="g-sub-scroll-bottom-btn" id="gSubScrollBtn">⬇ 回到最新</button>
 
-      <!-- Domain Mode Dropdown Menu -->
       <div class="g-sub-domain-menu" id="gSubDomainMenu">
         <div class="g-sub-domain-item active" data-domain="GENERAL">🌐 综合通用模式 (默认)</div>
         <div class="g-sub-domain-item" data-domain="CINEMA">🎬 影视 / 动漫与剧场模式</div>
@@ -271,15 +514,17 @@
   shadowRoot.appendChild(overlay);
   document.body.appendChild(hostEl);
 
-  // Element references
   const btnToggle = overlay.querySelector('#gSubToggle');
   const btnToggleIcon = overlay.querySelector('#gSubToggleIcon');
   const btnReconnect = overlay.querySelector('#gSubReconnect');
   const subBody = overlay.querySelector('#gSubBody');
   const statusText = overlay.querySelector('#gSubStatusText');
+  const connDot = overlay.querySelector('#gSubConnDot');
+  const volFill = overlay.querySelector('#gSubVolFill');
   const domainBtn = overlay.querySelector('#gSubDomainBtn');
   const domainText = overlay.querySelector('#gSubDomainText');
   const domainMenu = overlay.querySelector('#gSubDomainMenu');
+  const engineText = overlay.querySelector('#gSubEngineText');
   const scrollBottomBtn = overlay.querySelector('#gSubScrollBtn');
   const srcLangSelect = overlay.querySelector('#gSubSrcLang');
   const tgtLangSelect = overlay.querySelector('#gSubTgtLang');
@@ -292,260 +537,80 @@
   const blurVal = overlay.querySelector('#gSubBlurVal');
   const fontSizeSlider = overlay.querySelector('#gSubFontSizeSlider');
   const fontSizeVal = overlay.querySelector('#gSubFontSizeVal');
+  const displayModeSelect = overlay.querySelector('#gSubDisplayMode');
   const btnClear = overlay.querySelector('#gSubClear');
   const btnClose = overlay.querySelector('#gSubClose');
   const header = overlay.querySelector('#gSubHeader');
 
-  // Manual Reconnect Action
-  btnReconnect.addEventListener('click', () => {
-    statusText.textContent = '🔄 正在重置会话...';
-    restartSession();
-  });
+  // ---- 状态条 ----------------------------------------------------------
 
-  // Toggle Overlay Visibility Function
-  function toggleOverlayVisibility() {
-    if (overlay.style.display === 'none' || !overlay.style.display) {
-      overlay.style.display = 'flex';
-      applyInitialStyles();
-      if (!isRunning) startSubtitleService(true);
-    } else {
-      overlay.style.display = 'none';
-      settingsPanel.classList.remove('show');
-      domainMenu.classList.remove('show');
-      if (isRunning) stopSubtitleService(true);
+  const STATUS_COLORS = {
+    idle: '#94a3b8',
+    ok: '#34d399',
+    warn: '#f59e0b',
+    err: '#ef4444',
+    info: '#38bdf8'
+  };
+
+  function setStatus(kind, text) {
+    if (!statusText) return;
+    statusText.textContent = text;
+    statusText.style.color = STATUS_COLORS[kind] || STATUS_COLORS.idle;
+    if (connDot) {
+      connDot.style.background = STATUS_COLORS[kind] || STATUS_COLORS.idle;
+      connDot.style.boxShadow = kind === 'ok' ? '0 0 6px rgba(52,211,153,.9)' : 'none';
     }
+    hostEl.dataset.gltStatus = text;
+    hostEl.dataset.gltState = kind;
   }
 
-  // Domain Mode Menu Handling & In-Session Steering
-  domainBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    domainMenu.classList.toggle('show');
-  });
-
-  domainMenu.querySelectorAll('.g-sub-domain-item').forEach((item) => {
-    item.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const targetDomain = item.getAttribute('data-domain');
-      config.forcedDomain = targetDomain;
-      saveConfig(true);
-
-      domainMenu.querySelectorAll('.g-sub-domain-item').forEach(i => i.classList.remove('active'));
-      item.classList.add('active');
-      domainMenu.classList.remove('show');
-
-      applyDomainSwitch(targetDomain);
-    });
-  });
-
-  function applyDomainSwitch(forced) {
-    const pageCtx = getPageContext();
-    domainText.textContent = pageCtx.domainLabel;
-    activeDomain = pageCtx.domain;
-
-    if (isRunning && ws && ws.readyState === WebSocket.OPEN) {
-      console.log(`[Gemini Live] Domain switched to ${pageCtx.domainLabel}, refreshing session with new prompt...`);
-      restartSession();
-    }
-  }
-
-  // Settings Panel Toggle & Live Sliders
-  btnSettings.addEventListener('click', (e) => {
-    e.stopPropagation();
-    settingsPanel.classList.toggle('show');
-  });
-
-  // Retargeting-Aware Outside Click Detection (Shadow DOM Compatible)
-  document.addEventListener('click', (e) => {
-    const path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
-    if (!path.includes(settingsPanel) && !path.includes(btnSettings)) {
-      settingsPanel.classList.remove('show');
-    }
-    if (!path.includes(domainMenu) && !path.includes(domainBtn)) {
-      domainMenu.classList.remove('show');
-    }
-  });
-
-  opacitySlider.addEventListener('input', () => {
-    config.opacity = parseInt(opacitySlider.value, 10) / 100;
-    opacityVal.textContent = `${Math.round(config.opacity * 100)}%`;
-    overlay.style.setProperty('--g-sub-opacity', config.opacity);
-    saveConfig(false);
-  });
-
-  blurSlider.addEventListener('input', () => {
-    config.blur = parseInt(blurSlider.value, 10);
-    blurVal.textContent = `${config.blur}px`;
-    overlay.style.setProperty('--g-sub-blur', `${config.blur}px`);
-    saveConfig(false);
-  });
-
-  fontSizeSlider.addEventListener('input', () => {
-    config.fontSize = parseInt(fontSizeSlider.value, 10);
-    fontSizeVal.textContent = `${config.fontSize}px`;
-    overlay.style.setProperty('--g-sub-font-size', `${config.fontSize}px`);
-    saveConfig(false);
-  });
-
-  let saveConfigTimer = null;
-  /**
-   * Persists configuration to chrome.storage.local.
-   * @param {boolean} [immediate=false] When true, writes immediately without debounce delay.
-   */
-  function saveConfig(immediate = false) {
-    if (saveConfigTimer) {
-      clearTimeout(saveConfigTimer);
-      saveConfigTimer = null;
-    }
-
-    if (immediate) {
-      if (chrome.storage && chrome.storage.local) {
-        chrome.storage.local.set({ geminiLiveConfig: config });
-      }
-      return;
-    }
-
-    saveConfigTimer = setTimeout(() => {
-      if (chrome.storage && chrome.storage.local) {
-        chrome.storage.local.set({ geminiLiveConfig: config });
-      }
-      saveConfigTimer = null;
-    }, 250);
-  }
-
-  function applyInitialStyles() {
-    overlay.style.setProperty('--g-sub-opacity', config.opacity);
-    overlay.style.setProperty('--g-sub-blur', `${config.blur}px`);
-    overlay.style.setProperty('--g-sub-font-size', `${config.fontSize}px`);
-
-    if (config.width) overlay.style.width = `${config.width}px`;
-    if (config.height) overlay.style.height = `${config.height}px`;
-
-    ensureOverlayInViewport();
-
-    if (srcLangSelect && config.sourceLang) srcLangSelect.value = config.sourceLang;
-    if (tgtLangSelect && config.targetLang) tgtLangSelect.value = config.targetLang;
-
-    opacitySlider.value = Math.round(config.opacity * 100);
-    opacityVal.textContent = `${Math.round(config.opacity * 100)}%`;
-
-    blurSlider.value = config.blur;
-    blurVal.textContent = `${config.blur}px`;
-
-    fontSizeSlider.value = config.fontSize;
-    fontSizeVal.textContent = `${config.fontSize}px`;
-
-    const activeForced = config.forcedDomain || 'GENERAL';
-    domainMenu.querySelectorAll('.g-sub-domain-item').forEach((item) => {
-      if (item.getAttribute('data-domain') === activeForced) {
-        item.classList.add('active');
-      } else {
-        item.classList.remove('active');
-      }
-    });
-
-    const pageCtx = getPageContext();
-    domainText.textContent = pageCtx.domainLabel;
-  }
-
-  // 2. Gesture-Aware Scroll Tracking & Anti-Flicker rAF Batching
-  let scrollRafId = null;
-  let isScrollPending = false;
-  let isProgrammaticScrolling = false;
-
-  function cancelPendingScroll() {
-    if (scrollRafId !== null) {
-      cancelAnimationFrame(scrollRafId);
-      scrollRafId = null;
-      isScrollPending = false;
-    }
-  }
-
-  // Detect explicit user manual scroll gestures (Wheel & Touch)
-  subBody.addEventListener('wheel', (e) => {
-    if (e.deltaY < 0) {
-      // User scrolled UP explicitly
-      const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
-      if (distanceFromBottom > 60) {
-        isUserScrolledUp = true;
-        scrollBottomBtn.style.display = 'inline-block';
-        cancelPendingScroll();
-      }
-    } else if (e.deltaY > 0) {
-      // User scrolled DOWN - restore auto-scroll if near bottom
-      const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
-      if (distanceFromBottom <= 30) {
-        isUserScrolledUp = false;
-        scrollBottomBtn.style.display = 'none';
-      }
-    }
-  }, { passive: true });
-
-  subBody.addEventListener('scroll', () => {
-    if (isProgrammaticScrolling) return;
-
-    const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
-    if (distanceFromBottom <= 30) {
-      isUserScrolledUp = false;
-      scrollBottomBtn.style.display = 'none';
-    } else if (distanceFromBottom > 60 && isUserScrolledUp) {
-      scrollBottomBtn.style.display = 'inline-block';
-    }
-  });
-
-  scrollBottomBtn.addEventListener('click', () => {
-    cancelPendingScroll();
-    isUserScrolledUp = false;
-    scrollBottomBtn.style.display = 'none';
-    isProgrammaticScrolling = true;
-    subBody.scrollTop = subBody.scrollHeight;
-    requestAnimationFrame(() => {
-      isProgrammaticScrolling = false;
-    });
-  });
-
-  function safeScrollToBottom() {
-    if (isUserScrolledUp) return;
-    if (isScrollPending) return;
-
-    isScrollPending = true;
-    scrollRafId = requestAnimationFrame(() => {
-      isScrollPending = false;
-      scrollRafId = null;
-      if (!isUserScrolledUp && subBody) {
-        isProgrammaticScrolling = true;
-        subBody.scrollTop = subBody.scrollHeight;
-        requestAnimationFrame(() => {
-          isProgrammaticScrolling = false;
-        });
-      }
+  function setDiagnostics(partial) {
+    Object.keys(partial || {}).forEach((k) => {
+      hostEl.dataset['glt' + k] = String(partial[k]);
     });
   }
 
-  // 3. Robust Viewport Clamping & Adaptive Window Resize Engine (Scrollbar-Aware)
+  function updateEngineBadge() {
+    const isTranslate = isLiveTranslateModel(config.model);
+    if (engineText) {
+      engineText.textContent = isTranslate ? '原生同传' : 'Agent 语境';
+      engineText.title = isTranslate
+        ? '原生 Gemini 3.5 Live Translate：连续流式同传，不支持系统提示词'
+        : 'Live Agent 模型：支持系统提示词/语境模式，按语音停顿分段翻译';
+    }
+    hostEl.dataset.gltEngine = isTranslate ? 'translate' : 'agent';
+  }
+
+  // ---- 音量条 ----------------------------------------------------------
+
+  function renderVolume(level) {
+    volumeLevel = level;
+    if (volFill) {
+      const pct = Math.max(0, Math.min(100, Math.round(level * 3)));
+      volFill.style.width = pct + '%';
+      volFill.style.opacity = pct > 2 ? '1' : '0.25';
+    }
+  }
+
+  // ---- 拖拽 / 缩放 / 视口 ---------------------------------------------
+
   function getUsableViewport() {
     const docEl = document.documentElement;
-    // clientWidth/clientHeight strictly measure the usable content area inside the browser scrollbars
     const width = (docEl && docEl.clientWidth) ? docEl.clientWidth : window.innerWidth;
     const height = (docEl && docEl.clientHeight) ? docEl.clientHeight : window.innerHeight;
-    return {
-      width: Math.max(0, width),
-      height: Math.max(0, height)
-    };
+    return { width: Math.max(0, width), height: Math.max(0, height) };
   }
 
   function ensureOverlayInViewport() {
     if (!overlay || overlay.style.display === 'none') return;
     const viewport = getUsableViewport();
     if (viewport.width <= 0 || viewport.height <= 0) return;
-
     const overlayWidth = overlay.offsetWidth || config.width || 760;
     const overlayHeight = overlay.offsetHeight || config.height || 300;
-
     const maxLeft = Math.max(0, viewport.width - overlayWidth);
     const maxTop = Math.max(0, viewport.height - overlayHeight);
 
     let left, top;
-
     if (config.posRatio && config.posRatio.x !== undefined) {
       left = Math.round(config.posRatio.x * maxLeft);
       top = Math.round(config.posRatio.y * maxTop);
@@ -553,14 +618,11 @@
       left = typeof config.pos.left === 'number' ? config.pos.left : (parseFloat(config.pos.left) || 0);
       top = typeof config.pos.top === 'number' ? config.pos.top : (parseFloat(config.pos.top) || 0);
     } else {
-      // Default: Clean bottom-right corner flush against window edges (left of scrollbar)
       left = maxLeft;
       top = maxTop;
     }
-
     left = Math.max(0, Math.min(maxLeft, left));
     top = Math.max(0, Math.min(maxTop, top));
-
     overlay.style.left = `${left}px`;
     overlay.style.top = `${top}px`;
     overlay.style.right = 'auto';
@@ -576,9 +638,6 @@
     });
   });
 
-  let isDragging = false;
-  let dragOffset = { x: 0, y: 0 };
-
   header.addEventListener('mousedown', (e) => {
     if (e.target.closest('button') || e.target.closest('select') || e.target.closest('input')) return;
     isDragging = true;
@@ -593,17 +652,11 @@
     if (!isDragging) return;
     overlay.style.right = 'auto';
     overlay.style.bottom = 'auto';
-
     const viewport = getUsableViewport();
-    const overlayWidth = overlay.offsetWidth || 760;
-    const overlayHeight = overlay.offsetHeight || 300;
-
-    const maxLeft = Math.max(0, viewport.width - overlayWidth);
-    const maxTop = Math.max(0, viewport.height - overlayHeight);
-
+    const maxLeft = Math.max(0, viewport.width - (overlay.offsetWidth || 760));
+    const maxTop = Math.max(0, viewport.height - (overlay.offsetHeight || 300));
     const left = Math.max(0, Math.min(maxLeft, e.clientX - dragOffset.x));
     const top = Math.max(0, Math.min(maxTop, e.clientY - dragOffset.y));
-
     overlay.style.left = `${left}px`;
     overlay.style.top = `${top}px`;
   }
@@ -613,32 +666,18 @@
     isDragging = false;
     document.removeEventListener('mousemove', onDragMove);
     document.removeEventListener('mouseup', onDragEnd);
-
     const viewport = getUsableViewport();
-    const overlayWidth = overlay.offsetWidth || 760;
-    const overlayHeight = overlay.offsetHeight || 300;
-
-    const maxLeft = Math.max(0, viewport.width - overlayWidth);
-    const maxTop = Math.max(0, viewport.height - overlayHeight);
-
+    const maxLeft = Math.max(0, viewport.width - (overlay.offsetWidth || 760));
+    const maxTop = Math.max(0, viewport.height - (overlay.offsetHeight || 300));
     const currentLeft = Math.max(0, Math.min(maxLeft, parseFloat(overlay.style.left) || 0));
     const currentTop = Math.max(0, Math.min(maxTop, parseFloat(overlay.style.top) || 0));
-
-    config.pos = {
-      left: currentLeft,
-      top: currentTop
-    };
-
+    config.pos = { left: currentLeft, top: currentTop };
     config.posRatio = {
       x: maxLeft > 0 ? currentLeft / maxLeft : 1,
       y: maxTop > 0 ? currentTop / maxTop : 1
     };
-
     overlay.style.left = `${currentLeft}px`;
     overlay.style.top = `${currentTop}px`;
-    overlay.style.right = 'auto';
-    overlay.style.bottom = 'auto';
-
     saveConfig(true);
   }
 
@@ -655,7 +694,173 @@
     }
   });
 
-  // 4. UI Actions
+  function applyInitialStyles() {
+    overlay.style.setProperty('--g-sub-opacity', config.opacity);
+    overlay.style.setProperty('--g-sub-blur', `${config.blur}px`);
+    overlay.style.setProperty('--g-sub-font-size', `${config.fontSize}px`);
+    if (config.width) overlay.style.width = `${config.width}px`;
+    if (config.height) overlay.style.height = `${config.height}px`;
+    ensureOverlayInViewport();
+
+    if (srcLangSelect && config.sourceLang) srcLangSelect.value = config.sourceLang;
+    if (tgtLangSelect && config.targetLang) tgtLangSelect.value = config.targetLang;
+    if (displayModeSelect && config.displayMode) displayModeSelect.value = config.displayMode;
+
+    opacitySlider.value = Math.round(config.opacity * 100);
+    opacityVal.textContent = `${Math.round(config.opacity * 100)}%`;
+    blurSlider.value = config.blur;
+    blurVal.textContent = `${config.blur}px`;
+    fontSizeSlider.value = config.fontSize;
+    fontSizeVal.textContent = `${config.fontSize}px`;
+
+    const activeForced = config.forcedDomain || 'GENERAL';
+    domainMenu.querySelectorAll('.g-sub-domain-item').forEach((item) => {
+      item.classList.toggle('active', item.getAttribute('data-domain') === activeForced);
+    });
+
+    const pageCtx = getPageContext();
+    domainText.textContent = pageCtx.domainLabel;
+    activeDomain = pageCtx.domain;
+    updateEngineBadge();
+    applyDisplayMode();
+  }
+
+  function applyDisplayMode() {
+    const mode = config.displayMode || 'bilingual';
+    overlay.dataset.displayMode = mode;
+    const entries = subBody.querySelectorAll('.g-sub-entry');
+    entries.forEach((entry) => applyDisplayModeToEntry(entry));
+  }
+
+  function applyDisplayModeToEntry(entry) {
+    if (!entry || !entry._origEl || !entry._transEl) return;
+    const mode = config.displayMode || 'bilingual';
+    entry._origEl.style.display = (mode === 'trans') ? 'none' : '';
+    entry._transEl.style.display = (mode === 'orig') ? 'none' : '';
+  }
+
+  // ---- 设置存储 --------------------------------------------------------
+
+  let saveConfigTimer = null;
+  function saveConfig(immediate = false) {
+    if (saveConfigTimer) {
+      clearTimeout(saveConfigTimer);
+      saveConfigTimer = null;
+    }
+    const persist = () => {
+      try {
+        if (chrome.storage && chrome.storage.local) {
+          chrome.storage.local.set({ geminiLiveConfig: config });
+        }
+      } catch (e) { /* extension context invalidated */ }
+    };
+    if (immediate) { persist(); return; }
+    saveConfigTimer = setTimeout(persist, 250);
+  }
+
+  // ---- 滚动 ------------------------------------------------------------
+
+  let scrollRafId = null;
+  let isScrollPending = false;
+  let isProgrammaticScrolling = false;
+
+  function cancelPendingScroll() {
+    if (scrollRafId !== null) {
+      cancelAnimationFrame(scrollRafId);
+      scrollRafId = null;
+      isScrollPending = false;
+    }
+  }
+
+  subBody.addEventListener('wheel', (e) => {
+    if (e.deltaY < 0) {
+      const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
+      if (distanceFromBottom > 60) {
+        isUserScrolledUp = true;
+        scrollBottomBtn.style.display = 'inline-block';
+        cancelPendingScroll();
+      }
+    } else if (e.deltaY > 0) {
+      const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
+      if (distanceFromBottom <= 30) {
+        isUserScrolledUp = false;
+        scrollBottomBtn.style.display = 'none';
+      }
+    }
+  }, { passive: true });
+
+  subBody.addEventListener('scroll', () => {
+    if (isProgrammaticScrolling) return;
+    const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
+    if (distanceFromBottom <= 30) {
+      isUserScrolledUp = false;
+      scrollBottomBtn.style.display = 'none';
+    } else if (distanceFromBottom > 60 && isUserScrolledUp) {
+      scrollBottomBtn.style.display = 'inline-block';
+    }
+  });
+
+  scrollBottomBtn.addEventListener('click', () => {
+    cancelPendingScroll();
+    isUserScrolledUp = false;
+    scrollBottomBtn.style.display = 'none';
+    isProgrammaticScrolling = true;
+    subBody.scrollTop = subBody.scrollHeight;
+    requestAnimationFrame(() => { isProgrammaticScrolling = false; });
+  });
+
+  function safeScrollToBottom() {
+    if (isUserScrolledUp || isScrollPending) return;
+    isScrollPending = true;
+    scrollRafId = requestAnimationFrame(() => {
+      isScrollPending = false;
+      scrollRafId = null;
+      if (!isUserScrolledUp && subBody) {
+        isProgrammaticScrolling = true;
+        subBody.scrollTop = subBody.scrollHeight;
+        requestAnimationFrame(() => { isProgrammaticScrolling = false; });
+      }
+    });
+  }
+
+  // ---- UI 事件 ---------------------------------------------------------
+
+  btnReconnect.addEventListener('click', () => {
+    manualRestart('用户手动重置会话');
+  });
+
+  btnClear.addEventListener('click', clearSubtitleBody);
+
+  btnAudioMode.addEventListener('click', () => {
+    config.audioMode = config.audioMode === 'video' ? 'mic' : 'video';
+    updateAudioModeButton();
+    saveConfig(true);
+    if (isRunning) manualRestart('切换音源');
+  });
+
+  function updateAudioModeButton() {
+    btnAudioMode.textContent = config.audioMode === 'video' ? '🎵' : '🎙️';
+    btnAudioMode.title = config.audioMode === 'video' ? '当前音源: 网页视频（点击切换为麦克风）' : '当前音源: 麦克风 / 系统声音（点击切换为网页视频）';
+  }
+
+  srcLangSelect.addEventListener('change', () => {
+    config.sourceLang = srcLangSelect.value;
+    saveConfig(true);
+    // 源语言仅用于提示与展示，原生同传由模型自动识别
+  });
+
+  tgtLangSelect.addEventListener('change', () => {
+    config.targetLang = tgtLangSelect.value;
+    saveConfig(true);
+    updateEngineBadge();
+    if (isRunning) manualRestart('切换目标语言');
+  });
+
+  btnToggle.addEventListener('click', () => {
+    if (isRunning) stopSubtitleService(true);
+    else startSubtitleService(true);
+  });
+
   btnClose.addEventListener('click', () => {
     overlay.style.display = 'none';
     settingsPanel.classList.remove('show');
@@ -663,7 +868,87 @@
     if (isRunning) stopSubtitleService(true);
   });
 
-  btnClear.addEventListener('click', () => {
+  btnSettings.addEventListener('click', (e) => {
+    e.stopPropagation();
+    settingsPanel.classList.toggle('show');
+  });
+
+  domainBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    domainMenu.classList.toggle('show');
+  });
+
+  domainMenu.querySelectorAll('.g-sub-domain-item').forEach((item) => {
+    item.addEventListener('click', (e) => {
+      e.stopPropagation();
+      config.forcedDomain = item.getAttribute('data-domain');
+      saveConfig(true);
+      domainMenu.querySelectorAll('.g-sub-domain-item').forEach((i) => i.classList.remove('active'));
+      item.classList.add('active');
+      domainMenu.classList.remove('show');
+      const pageCtx = getPageContext();
+      domainText.textContent = pageCtx.domainLabel;
+      activeDomain = pageCtx.domain;
+      if (isRunning && !isLiveTranslateModel(config.model)) {
+        manualRestart('切换语境模式');
+      } else if (isRunning) {
+        setStatus('info', '已切换语境（原生同传模型不读取提示词，将在下次重连后生效于 Agent 模型）');
+        setTimeout(() => { if (isRunning) setStatus('ok', '正在同传'); }, 2600);
+      }
+    });
+  });
+
+  document.addEventListener('click', (e) => {
+    const path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
+    if (!path.includes(settingsPanel) && !path.includes(btnSettings)) settingsPanel.classList.remove('show');
+    if (!path.includes(domainMenu) && !path.includes(domainBtn)) domainMenu.classList.remove('show');
+  });
+
+  opacitySlider.addEventListener('input', () => {
+    config.opacity = parseInt(opacitySlider.value, 10) / 100;
+    opacityVal.textContent = `${Math.round(config.opacity * 100)}%`;
+    overlay.style.setProperty('--g-sub-opacity', config.opacity);
+    saveConfig(false);
+  });
+  blurSlider.addEventListener('input', () => {
+    config.blur = parseInt(blurSlider.value, 10);
+    blurVal.textContent = `${config.blur}px`;
+    overlay.style.setProperty('--g-sub-blur', `${config.blur}px`);
+    saveConfig(false);
+  });
+  fontSizeSlider.addEventListener('input', () => {
+    config.fontSize = parseInt(fontSizeSlider.value, 10);
+    fontSizeVal.textContent = `${config.fontSize}px`;
+    overlay.style.setProperty('--g-sub-font-size', `${config.fontSize}px`);
+    saveConfig(false);
+  });
+  displayModeSelect.addEventListener('change', () => {
+    config.displayMode = displayModeSelect.value;
+    applyDisplayMode();
+    saveConfig(true);
+  });
+
+  // ---- 全屏重挂载 ------------------------------------------------------
+
+  function handleFullscreenChange() {
+    const fsElement = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement;
+    if (fsElement) {
+      if (hostEl.parentElement !== fsElement) fsElement.appendChild(hostEl);
+    } else if (hostEl.parentElement !== document.body) {
+      document.body.appendChild(hostEl);
+    }
+  }
+  document.addEventListener('fullscreenchange', handleFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+
+  // ========================================================================
+  // 5. 字幕引擎
+  // ========================================================================
+
+  const TERMINAL_PUNCT_RE = /[。！？!?…\n]$/;
+  const TERMINAL_PUNCT_ANY_RE = /[。！？!?…\n]/;
+
+  function clearSubtitleBody() {
     cancelPendingScroll();
     subBody.innerHTML = `
       <div class="g-sub-entry" id="gSubInitialPrompt">
@@ -673,308 +958,12 @@
     currentStreamingEntry = null;
     currentOrigBuffer = '';
     currentTransBuffer = '';
+    committedLines = 0;
+    setDiagnostics({ Lines: 0 });
     subBody.scrollTop = 0;
-  });
-
-  btnAudioMode.addEventListener('click', () => {
-    config.audioMode = config.audioMode === 'video' ? 'mic' : 'video';
-    btnAudioMode.textContent = config.audioMode === 'video' ? '🎵' : '🎙️';
-    btnAudioMode.title = config.audioMode === 'video' ? '当前音源: 网页视频' : '当前音源: 麦克风/系统声音';
-    saveConfig(true);
-    if (isRunning) restartSession();
-  });
-
-  srcLangSelect.addEventListener('change', () => {
-    config.sourceLang = srcLangSelect.value;
-    saveConfig(true);
-    if (isRunning) restartSession();
-  });
-
-  tgtLangSelect.addEventListener('change', () => {
-    config.targetLang = tgtLangSelect.value;
-    saveConfig(true);
-    if (isRunning) restartSession();
-  });
-
-  btnToggle.addEventListener('click', () => {
-    if (isRunning) {
-      stopSubtitleService(true);
-    } else {
-      startSubtitleService(true);
-    }
-  });
-
-  // 5. Cross-Lingual Syntactic Clause & Prosodic Lyric Segmentation Engine
-  const TERMINAL_PUNCTUATION_REGEX = /[。！？!?\n]/;
-  
-  // Forbidden tail words: A sentence or lyric verse must NEVER be severed right after these open tokens
-  const ZH_UNFINISHED_TAIL = /(的|地|得|在|于|把|被|让|从|向|为|给|和|与|或|以及|因为|所以|如果|虽然|但是|而且|不仅|却|即使|即便|着|会|能|想|要|去|什么|那|这|那个|某|那时候|这个时候|当时|时|的时候|然后|之后|接下来|后来|非常|特别|十分|很|极|挺|过于|太|更|最|相当|稍微|格外|正在|准备|打算|因为是|觉得|感觉)\s*$/;
-  const JA_UNFINISHED_TAIL = /(の|に|へ|で|と|を|から|より|まで|は|が|も|って|という|けど|けれど|ので|のに|ても|でも|て|で|ながら|たり|し|あの|その|この|えっと|時|とき|その時|あの時|すごく|とても|めっちゃ|なんか|なんかさ|って感じ|ていうか|やはり|やっぱり)\s*$/;
-  const EN_UNFINISHED_TAIL = /\b(for|to|in|on|at|of|with|by|from|about|into|through|during|before|after|and|or|but|that|which|who|whom|whose|where|when|while|because|although|if|as|than|the|a|an|is|are|was|were|be|been|being|have|has|had|very|really|quite|extremely|then|when|while)\s*$/i;
-
-  // Short conversational fillers that MUST NOT be split into individual lines
-  const IS_STANDALONE_FILLER = /^(嗯|好的|啊|好|对|是的|算了吧|算了|好吧|行|真的吗|诶|哎|也就是|那个|等等|稍等|好吧|对啊|就是|对的|好的好的|嗯嗯|哈|呀|吧|呼|了呢|是这样|然后呢|那么)[。！？!?，,\s]*$/;
-
-  function isSentenceSyntacticallyComplete(orig, trans) {
-    const trimmedOrig = (orig || '').trim();
-    const trimmedTrans = (trans || '').trim();
-
-    if (!trimmedTrans) return false;
-
-    const hasTerminal = /[。！？!?\n]/.test(trimmedTrans) || /[。！？!?\n]/.test(trimmedOrig);
-    const isDangling = ZH_UNFINISHED_TAIL.test(trimmedTrans);
-
-    if (hasTerminal && !isDangling && trimmedTrans.length >= 2) {
-      return true;
-    }
-
-    if (trimmedTrans.length >= 24 && !isDangling) {
-      return true;
-    }
-
-    return trimmedTrans.length >= 35;
   }
 
-  function commitActiveSentence(force = false) {
-    const trimmed = currentTransBuffer.trim();
-    if (!trimmed) {
-      if (currentStreamingEntry && !currentOrigBuffer.trim()) {
-        currentStreamingEntry.remove();
-        currentStreamingEntry = null;
-      }
-      return;
-    }
-
-    // Anti-fragment protection on silence timeout: if not forced (e.g. video pause/stop),
-    // do not commit if it's standalone filler, unfinished tail, or short without terminal punctuation
-    if (!force) {
-      if (IS_STANDALONE_FILLER.test(trimmed)) {
-        return;
-      }
-      if (trimmed.length < 8 && !/[。！？!?\n]/.test(trimmed)) {
-        return;
-      }
-      if (ZH_UNFINISHED_TAIL.test(trimmed) || 
-          JA_UNFINISHED_TAIL.test(currentOrigBuffer.trim()) || 
-          EN_UNFINISHED_TAIL.test(currentOrigBuffer.trim())) {
-        return;
-      }
-    }
-
-    if (currentStreamingEntry) {
-      currentStreamingEntry.classList.remove('streaming');
-      if (currentStreamingEntry._transText) {
-        currentStreamingEntry._transText.nodeValue = currentTransBuffer;
-      }
-      currentStreamingEntry = null;
-    }
-    currentOrigBuffer = '';
-    currentTransBuffer = '';
-
-    while (subBody.children.length > 50) {
-      subBody.removeChild(subBody.firstChild);
-    }
-    safeScrollToBottom();
-  }
-
-  // Target Language Rule Factory (Fully Dynamic per Selected Target Language)
-  function getTargetLanguageRule(targetLang) {
-    const t = (targetLang || '').toLowerCase();
-    if (t.includes('英语') || t.includes('english') || t.includes('en')) {
-      return {
-        id: 'en',
-        name: 'English',
-        nameEn: 'English (US/UK)',
-        systemPrompt: `[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.
-TARGET LANGUAGE: Strictly English.
-INPUT AUDIO: Japanese / Chinese / Spanish / Foreign Language Speech & Singing.
-
-RULES:
-1. OUTPUT LANGUAGE MUST ALWAYS BE 100% English.
-2. Translate all non-English speech directly into natural English.
-3. NEVER output Chinese characters (汉字) or Japanese Kana (假名).
-4. Only output the translated English text. Never output notes or explanations.`,
-        negativeRule: '必须全部翻译为 English 输出，严禁输出中文汉字或日文假名。',
-        initTurnText: '[Initialization]: Translate all incoming audio in real-time strictly into English. Never output original foreign speech.',
-        driftWarning: '[Language Drift]: Target language is English. Please output all translations in English only!'
-      };
-    } else if (t.includes('日语') || t.includes('japanese') || t.includes('ja')) {
-      return {
-        id: 'ja',
-        name: '日本語',
-        nameEn: 'Japanese (日本語)',
-        systemPrompt: `[CRITICAL DIRECTIVE]: あなたはリアルタイムの同時通訳システムです。
-TARGET LANGUAGE: 日本語 (Japanese).
-INPUT AUDIO: 英語・中国語などの外国語音声。
-
-RULES:
-1. 出力言語は100%【日本語】で統一してください。
-2. 外国語の音声を自然で流暢な日本語に翻訳して出力してください。
-3. 英語や中国語の原文をそのまま出力しないでください。
-4. 翻訳結果のテキストのみを出力し、説明や注釈は出力しないでください。`,
-        negativeRule: '翻訳結果はすべて日本語で出力してください。外国語の原文を出力しないでください。',
-        initTurnText: '【通訳初期化指示】：すべての音声をリアルタイムで【日本語】に通訳して出力してください。',
-        driftWarning: '【言語修正】：ターゲット言語は日本語です。翻訳結果はすべて日本語で出力してください。'
-      };
-    }
-
-    // Default: Simplified Chinese
-    return {
-      id: 'zh',
-      name: '简体中文',
-      nameEn: 'Simplified Chinese (zh-CN)',
-      systemPrompt: `[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.
-TARGET LANGUAGE: Strictly Simplified Chinese (简体中文 / zh-CN).
-INPUT AUDIO: Japanese / English / Foreign Language Speech & Audio.
-
-RULES:
-1. OUTPUT LANGUAGE MUST ALWAYS BE 100% Simplified Chinese (简体中文).
-2. Translate all foreign speech directly into natural Simplified Chinese.
-3. NEVER output English translations or Japanese transcriptions when the target is Chinese.
-4. Only output the translated Chinese text. Never output notes or explanations.
-
-【翻译铁律】：
-1. 输出语言唯一：无论输入的原始音频是何种语言，输出文本必须 100% 全部使用【简体中文】。
-2. 严禁原文复述：绝对严禁输出任何英文翻译或日文假名原文。
-3. 仅输出翻译文本，不要输出任何解释或注释。`,
-      negativeRule: '必须全部同传翻译为简体中文输出，严禁输出英文或日文假名。',
-      initTurnText: '【同传初始化指令】：请将接收到的全部音频内容同声传译为【简体中文】。严禁输出英文或日文。',
-      driftWarning: '【系统指令】：目标语言是【简体中文】！请立即将接收到的音频全部同声传译为简体中文输出！严禁输出英文或日文！'
-    };
-  }
-
-  /**
-   * Fast Zero-Allocation Language Drift Checker
-   * Uses single-pass charCodeAt with early-exit conditions.
-   */
-  function isLanguageDrifted(chunk, targetId) {
-    if (!chunk || typeof chunk !== 'string') return false;
-    const len = chunk.length;
-
-    if (targetId === 'zh') {
-      let hasChinese = false;
-      let latinCount = 0;
-      for (let i = 0; i < len; i++) {
-        const code = chunk.charCodeAt(i);
-        // Immediate early-exit on Kana or Hangul when target is Chinese
-        if ((code >= 0x3040 && code <= 0x30FF) || 
-            (code >= 0xAC00 && code <= 0xD7AF) || 
-            (code >= 0x1100 && code <= 0x11FF) || 
-            (code >= 0x3130 && code <= 0x318F)) {
-          return true;
-        }
-        if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF)) {
-          hasChinese = true;
-        } else if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
-          latinCount++;
-        }
-      }
-      // Only drifted if Latin words dominate without any Chinese ideographs
-      return !hasChinese && latinCount > 3;
-    }
-
-    if (targetId === 'en') {
-      for (let i = 0; i < len; i++) {
-        const code = chunk.charCodeAt(i);
-        // Immediate early-exit on any Asian character when target is English
-        if ((code >= 0x4E00 && code <= 0x9FFF) || 
-            (code >= 0x3400 && code <= 0x4DBF) || 
-            (code >= 0x3040 && code <= 0x30FF) || 
-            (code >= 0xAC00 && code <= 0xD7AF) || 
-            (code >= 0x1100 && code <= 0x11FF) || 
-            (code >= 0x3130 && code <= 0x318F)) {
-          return true;
-        }
-      }
-      return false;
-    }
-
-    if (targetId === 'ja') {
-      let hasKanaOrKanji = false;
-      let latinCount = 0;
-      for (let i = 0; i < len; i++) {
-        const code = chunk.charCodeAt(i);
-        // Immediate early-exit on Hangul when target is Japanese
-        if ((code >= 0xAC00 && code <= 0xD7AF) || 
-            (code >= 0x1100 && code <= 0x11FF) || 
-            (code >= 0x3130 && code <= 0x318F)) {
-          return true;
-        }
-        if ((code >= 0x3040 && code <= 0x30FF) || 
-            (code >= 0x4E00 && code <= 0x9FFF) || 
-            (code >= 0x3400 && code <= 0x4DBF)) {
-          hasKanaOrKanji = true;
-        } else if ((code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
-          latinCount++;
-        }
-      }
-      return !hasKanaOrKanji && latinCount > 3;
-    }
-
-    return false;
-  }
-
-  let lastDriftWarningTime = 0;
-  function checkAndCorrectLanguageDrift(chunk) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const tgtRule = getTargetLanguageRule(config.targetLang);
-
-    if (isLanguageDrifted(chunk, tgtRule.id) && Date.now() - lastDriftWarningTime > 5000) {
-      lastDriftWarningTime = Date.now();
-      console.warn(`[Gemini Live] Target language drift detected (${tgtRule.name}) in translation.`);
-    }
-  }
-
-  function handleIncomingOriginalChunk(chunk) {
-    const initPrompt = overlay.querySelector('#gSubInitialPrompt');
-    if (initPrompt) initPrompt.remove();
-
-    console.log('[Gemini Live Translator] Input speech chunk:', chunk);
-    currentOrigBuffer += chunk;
-    updateActiveStreamingEntry();
-    lastAudioTime = Date.now();
-
-    if (config.sourceLang.includes('自动识别')) {
-      const lang = detectLanguageFromText(currentOrigBuffer);
-      if (lang !== 'auto' && lang !== detectedSourceLang) {
-        detectedSourceLang = lang;
-        const langMap = {
-          'ja': '🇯🇵 日语',
-          'en': '🇺🇸 英语',
-          'ko': '🇰🇷 韩语',
-          'zh': '🇨🇳 中文'
-        };
-        const detectedName = langMap[lang] || '多语言';
-        const optAuto = srcLangSelect.querySelector('option[value*="自动识别"]');
-        if (optAuto) {
-          optAuto.textContent = `🌐 自动 (${detectedName})`;
-        }
-      }
-    }
-  }
-
-  function handleIncomingTranslatedChunk(chunk) {
-    const initPrompt = overlay.querySelector('#gSubInitialPrompt');
-    if (initPrompt) initPrompt.remove();
-
-    console.log('[Gemini Live Translator] Translated chunk:', chunk);
-    currentTransBuffer += chunk;
-    updateActiveStreamingEntry();
-    lastAudioTime = Date.now();
-
-    // Dynamically check for target language drift
-    checkAndCorrectLanguageDrift(currentTransBuffer);
-
-    if (isSentenceSyntacticallyComplete(currentOrigBuffer, currentTransBuffer)) {
-      splitAndCommitSentences();
-    }
-  }
-
-  /**
-   * Zero-Reflow Subtitle Streaming Renderer
-   * Mutates persistent Text nodes directly without HTML parsing or DOM recreation.
-   */
-  function updateActiveStreamingEntry() {
+  function ensureStreamingEntry() {
     const initPrompt = overlay.querySelector('#gSubInitialPrompt');
     if (initPrompt) initPrompt.remove();
 
@@ -982,23 +971,19 @@ RULES:
       const entry = document.createElement('div');
       entry.className = 'g-sub-entry streaming';
 
-      // Original speech container & Text node
       const origEl = document.createElement('div');
       origEl.className = 'g-sub-orig';
-      origEl.style.display = 'none';
       const origTextNode = document.createTextNode('');
       origEl.appendChild(origTextNode);
 
-      // Translation container & Text node
       const transEl = document.createElement('div');
       transEl.className = 'g-sub-trans';
-      const transTextNode = document.createTextNode('...');
+      const transTextNode = document.createTextNode('…');
       transEl.appendChild(transTextNode);
 
       entry.appendChild(origEl);
       entry.appendChild(transEl);
 
-      // Cache references on the DOM entry instance for zero-lookup access
       entry._origEl = origEl;
       entry._origText = origTextNode;
       entry._transEl = transEl;
@@ -1006,332 +991,227 @@ RULES:
 
       subBody.appendChild(entry);
       currentStreamingEntry = entry;
+      applyDisplayModeToEntry(entry);
     }
+    return currentStreamingEntry;
+  }
 
-    // Mutate Original Speech Text Node
-    if (currentOrigBuffer) {
-      if (currentStreamingEntry._origEl.style.display === 'none') {
-        currentStreamingEntry._origEl.style.display = '';
+  function renderStreamingLine() {
+    const entry = ensureStreamingEntry();
+    const mode = config.displayMode || 'bilingual';
+
+    if (mode !== 'trans') {
+      if (currentOrigBuffer) {
+        entry._origEl.style.display = '';
+        entry._origText.nodeValue = currentOrigBuffer;
+      } else {
+        entry._origEl.style.display = 'none';
       }
-      currentStreamingEntry._origText.nodeValue = currentOrigBuffer;
     } else {
-      if (currentStreamingEntry._origEl.style.display !== 'none') {
-        currentStreamingEntry._origEl.style.display = 'none';
-      }
+      entry._origEl.style.display = 'none';
     }
 
-    // Mutate Translated Speech Text Node
-    currentStreamingEntry._transText.nodeValue = currentTransBuffer || '...';
-
-    // Request batched scroll update
+    if (mode !== 'orig') {
+      entry._transEl.style.display = '';
+      entry._transText.nodeValue = currentTransBuffer || '…';
+    } else {
+      entry._transEl.style.display = 'none';
+    }
     safeScrollToBottom();
   }
 
-  function splitAndCommitSentences() {
-    if (currentTransBuffer.trim().length > 3 || currentOrigBuffer.trim().length > 4) {
+  function scheduleCommit(reason, delay) {
+    pendingCommitReason = reason;
+    if (commitGraceTimer) clearTimeout(commitGraceTimer);
+    commitGraceTimer = setTimeout(() => {
+      commitGraceTimer = null;
+      commitCurrentLine(false, pendingCommitReason || reason);
+    }, Math.max(0, delay || 0));
+  }
+
+  function commitCurrentLine(force, reason) {
+    const hasOrig = !!currentOrigBuffer.trim();
+    const hasTrans = !!currentTransBuffer.trim();
+    if (!hasOrig && !hasTrans) {
       if (currentStreamingEntry) {
-        currentStreamingEntry.classList.remove('streaming');
-        if (currentStreamingEntry._transText) {
-          currentStreamingEntry._transText.nodeValue = currentTransBuffer;
-        }
+        if (!force && !currentTransBuffer) currentStreamingEntry.remove();
         currentStreamingEntry = null;
       }
-      currentOrigBuffer = '';
-      currentTransBuffer = '';
+      return;
+    }
+    if (!force && !hasTrans && !(config.displayMode === 'orig' && hasOrig)) return; // 还没有译文，先留在流式行里
 
-      // Maintain max history buffer (40 entries) to prevent DOM bloat
-      while (subBody.children.length > 40) {
-        subBody.removeChild(subBody.firstChild);
+    const entry = currentStreamingEntry;
+    if (entry) {
+      entry.classList.remove('streaming');
+      if (entry._transText) entry._transText.nodeValue = currentTransBuffer || '';
+      if (entry._origText) entry._origText.nodeValue = currentOrigBuffer || '';
+      // 同语言 echo 去重：原文与译文完全一致时隐藏原文行
+      if (entry._origEl && currentOrigBuffer.trim() === currentTransBuffer.trim()) {
+        entry._origEl.style.display = 'none';
       }
-      safeScrollToBottom();
+      currentStreamingEntry = null;
     }
+
+    currentOrigBuffer = '';
+    currentTransBuffer = '';
+    committedLines++;
+    setDiagnostics({ Lines: committedLines, LastCommitReason: reason || 'auto', LastCommitAt: now() });
+
+    while (subBody.children.length > 60) subBody.removeChild(subBody.firstChild);
+    safeScrollToBottom();
   }
 
-  const HTML_ESCAPE_MAP = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;',
-    '`': '&#96;'
-  };
-  const HTML_ESCAPE_REGEX = /[&<>"'`]/g;
-
-  /**
-   * High-performance full DOM sanitizer escaping &, <, >, ", ', and `
-   * Uses non-allocating fast-path check for strings without special chars.
-   */
-  function escapeHtml(str) {
-    if (str === null || str === undefined) return '';
-    const s = typeof str === 'string' ? str : String(str);
-    if (!HTML_ESCAPE_REGEX.test(s)) return s;
-    return s.replace(HTML_ESCAPE_REGEX, (ch) => HTML_ESCAPE_MAP[ch]);
+  function bufferEndsWithTerminal(buffer) {
+    const s = String(buffer || '').replace(/[\s"'”’）)\]】」』]+$/g, '');
+    return TERMINAL_PUNCT_RE.test(s);
   }
 
-  // 6. Universal Multi-Dimensional Domain Classifier
-  // Relies on Platform Native Metadata & Generic Structural Format Identifiers (No hardcoded individual names)
-  function getPageContext() {
-    let title = document.title || '';
-    title = title.replace(/\s*-\s*YouTube$/i, '').replace(/\s*-\s*Twitch$/i, '').replace(/\s*_\s*哔哩哔哩_bilibili$/i, '').trim();
+  function onOriginalDelta(text) {
+    if (!text) return;
+    if (commitGraceTimer) { clearTimeout(commitGraceTimer); commitGraceTimer = null; }
+    lastTranscriptionAt = now();
+    lastServerMessageAt = lastTranscriptionAt;
+    currentOrigBuffer += text;
+    renderStreamingLine();
 
-    let channelName = '';
-    const channelEl = document.querySelector('#owner #channel-name a, ytd-channel-name a, #upload-info #channel-name a, [data-a-target="user-channel-link"], .up-name, .username, .up-info--right .name, #channel-header-container');
-    if (channelEl) {
-      channelName = channelEl.textContent.trim();
-    }
-
-    // Extract native platform category metadata
-    let platformGenre = '';
-    const genreMeta = document.querySelector('meta[itemprop="genre"], meta[property="og:video:type"], meta[name="category"]');
-    if (genreMeta && genreMeta.content) platformGenre += ' ' + genreMeta.content;
-
-    let metaTags = '';
-    const tagMeta = document.querySelectorAll('meta[property="og:video:tag"], meta[name="keywords"], meta[property="og:title"]');
-    tagMeta.forEach(m => {
-      if (m.content) metaTags += ' ' + m.content;
-    });
-
-    const extraTagElements = document.querySelectorAll('.tag-link, .video-tag a, .breadcrumb-item, a[href*="/v/"], .video-tag-container a, yt-formatted-string.super-title a, a[href*="/hashtag/"], ytd-badge-supported-renderer, [data-a-target="stream-game-link"]');
-    extraTagElements.forEach(t => {
-      if (t.textContent) metaTags += ' ' + t.textContent;
-    });
-
-    // Check manual override
-    if (config.forcedDomain && config.forcedDomain !== 'auto') {
-      const labels = {
-        'CINEMA': '🎬 影视 / 动漫与剧场',
-                'VTUBER': '🎙️ VTuber / 圈内与歌回',
-        'TECH_LECTURE': '🎓 科技 / 学术演讲',
-        'GAMING': '🎮 游戏实况 / 电竞',
-        'GENERAL': '🌐 综合通用模式'
-      };
-      return {
-        title: title.slice(0, 150),
-        channel: channelName.slice(0, 80),
-        domain: config.forcedDomain,
-        domainLabel: labels[config.forcedDomain] || '🏷️ 自定义模式'
-      };
-    }
-
-    const titleLower = title.toLowerCase();
-    const channelLower = channelName.toLowerCase();
-    const metaLower = (metaTags + ' ' + platformGenre).toLowerCase();
-    const fullText = `${titleLower} ${channelLower} ${metaLower}`;
-
-    const scores = { CINEMA: 0, VTUBER: 0, TECH_LECTURE: 0, GAMING: 0 };
-
-    // 1. Platform Native Category Mapping (+30 score)
-        if (/gaming|游戏|单机游戏|网游/.test(metaLower)) scores.GAMING += 30;
-    if (/film & animation|anime|bangumi|番剧|动画|影视|电影/.test(metaLower)) scores.CINEMA += 30;
-    if (/education|science & technology|知识|公开课|科技/.test(metaLower)) scores.TECH_LECTURE += 30;
-    if (/just chatting|virtual youtuber|雑談/.test(metaLower)) scores.VTUBER += 30;
-
-    // 2. Comprehensive Generic Structural Format Identifiers
-    const formatPatterns = {
-      VTUBER: [
-        'vtuber', 'vstreamer', 'バーチャル', '生配信', '雑談', '歌枠', '歌雑', '凸待ち', 'メン限', 'ms限定',
-        '切り抜き', 'virtual youtuber', 'v-tuber', 'sub ch', 'sub channel', 'メンバーシップ', '初配信', '3dお披露目',
-        '自己紹介', 'ラジオ', 'radio', '生放送', '放送', '新衣装', '定期配信', 'コラボ', 'collab', '企画', '耐久', '朝活', '夜活',
-        '初投稿', '観測部', 'ファンクラブ', 'fanclub', '枠', 'ライバー', 'liver'
-      ],
-      CINEMA: [
-        'anime', 'animation', 'theatrical', 'ova', 'ona', 'movie', 'film', 'cinema', 'drama', 'series', 'season', 'trailer', 'teaser',
-        'アニメ', '劇場版', '映画', 'ドラマ', '番剧', '新番', '剧场版', '动画', '声優', '配音', '熟肉', '超清中字', '汉化', '中字', '字幕',
-        '预告片', '予告', '特報', '本編', '前編', '後編', '総集編', '作画', '正片', '全集', '吹き替え', 'アフレコ'
-      ],
-      TECH_LECTURE: [
-        'keynote', 'symposium', 'colloquium', 'lecture', 'seminar', 'conference', 'presentation', 'tutorial', 'course', 'workshop',
-        'ted', 'tedx', 'panel discussion', 'roundtable', 'fireside chat', 'interview', 'debate', 'dialogue', 'documentary',
-        '公开课', '学术报告', '研讨会', '讲座', '论坛', '教程', '访谈', '学术', '演讲'
-      ],
-      GAMING: [
-        'gameplay', 'walkthrough', 'playthrough', 'speedrun', 'esports', 'lets play', "let's play", 'boss fight',
-        '実況', 'ゲーム実況', 'ゲーム配信', 'ゲームプレイ', 'プレイ動画', '初見', '縛りプレイ', 'クリア',
-        '游戏实况', '实况解说', '通关攻略', '对决', '试玩'
-      ]
-    };
-
-    // Regex check for episodic anime/series patterns: e.g. 第1話, 第12集, EP01, #01, etc.
-    if (/第\s*\d+\s*[話话集期]|ep\s*\d+|全\s*\d+\s*[話话集]|#\s*\d+/i.test(titleLower)) {
-      scores.CINEMA += 25;
-    }
-
-    // Match structural terms across title (weight 20) and metadata (weight 10)
-    for (const [domainKey, terms] of Object.entries(formatPatterns)) {
-      terms.forEach(term => {
-        if (titleLower.includes(term) || channelLower.includes(term)) {
-          scores[domainKey] += 20;
-        } else if (metaLower.includes(term)) {
-          scores[domainKey] += 10;
-        }
-      });
-    }
-
-    let maxDomain = 'GENERAL';
-    let maxScore = 0;
-
-    for (const [domainKey, score] of Object.entries(scores)) {
-      if (score > maxScore) {
-        maxScore = score;
-        maxDomain = domainKey;
+    if (String(config.sourceLang || '').includes('自动识别')) {
+      const lang = detectLanguageFromText(currentOrigBuffer);
+      if (lang !== 'auto' && lang !== detectedSourceLang) {
+        detectedSourceLang = lang;
+        const langMap = { ja: '🇯🇵 日语', en: '🇺🇸 英语', ko: '🇰🇷 韩语', zh: '🇨🇳 中文' };
+        const optAuto = srcLangSelect.querySelector('option[value*="自动识别"]');
+        if (optAuto) optAuto.textContent = `🌐 自动 (${langMap[lang] || '多语言'})`;
+        setDiagnostics({ SrcLang: lang });
       }
     }
-
-    // Lower threshold to 8 to ensure single strong signal immediately matches
-    if (maxScore < 8) {
-      maxDomain = 'GENERAL';
-    }
-
-    const domainLabels = {
-      'CINEMA': '🎬 影视 / 动漫与剧场',
-            'VTUBER': '🎙️ VTuber / 圈内与歌回',
-      'TECH_LECTURE': '🎓 科技 / 学术演讲',
-      'GAMING': '🎮 游戏实况 / 电竞',
-      'GENERAL': '🌐 综合通用模式'
-    };
-
-    return {
-      title: title.slice(0, 150),
-      channel: channelName.slice(0, 80),
-      domain: maxDomain,
-      domainLabel: domainLabels[maxDomain]
-    };
+    maybeCommitByBoundary();
   }
 
-  // 7. Modular System Prompt Factory
-  function buildDynamicSystemPrompt(pageCtx) {
-    const srcLangDesc = config.sourceLang.includes('自动')
-      ? '自动识别（根据音频输入实时判断源语言）'
-      : config.sourceLang;
-
-    const tgtRule = getTargetLanguageRule(config.targetLang);
-
-    const baseHeader = `${tgtRule.systemPrompt}
-
-【视频参考背景】：
-- 标题：${pageCtx.title || '无'}
-- 频道：${pageCtx.channel || '无'}
-- 源语言：${srcLangDesc}
-- 目标语言：【${tgtRule.name}】`;
-
-    let domainModule = '';
-
-    switch (pageCtx.domain) {
-      case 'CINEMA':
-        domainModule = `
-【影视动漫与剧场场景】：
-- 风格引导：地道生动的影视译制与动漫配词风格，生动传达人物性格、情绪起伏与戏剧张力。
-- 对白节奏：契合剧情对话节奏，多人交替对白时保持各句清晰独立。
-- 声音过滤：专注人物台词与画外音，忽略环境拟音、打斗与背景垫乐。`;
-        break;
-
-      case 'VTUBER':
-        domainModule = `
-【VTuber 与网络直播场景】：
-- 交流风格：口语生动自然、亲切连贯，精准传达主播的语气情绪与幽默感。
-- 互动节奏：契合直播交流节奏，清晰传达主播与观众的互动氛围与生动表达。`;
-        break;
-
-      case 'TECH_LECTURE':
-        domainModule = `
-【科技与学术演讲场景】：
-- 风格引导：严谨准确、逻辑清晰，符合学术论坛与行业会议的规范表达。
-- 论述完整：完整传达复合长句与从句的逻辑脉络，行业术语使用通用标准称谓。`;
-        break;
-
-      case 'GAMING':
-        domainModule = `
-【游戏实况与电竞场景】：
-- 风格引导：节奏明快、生动传神，准确传递玩家的操作情绪、战术沟通与临场反应。
-- 游戏概念：贴合玩家习惯，准确翻译核心机制、技能、装备与赛场术语。`;
-        break;
-
-      case 'GENERAL':
-      default:
-        domainModule = `
-【通用视频场景】：
-- 风格引导：流畅通顺、通俗自然，准确传达说话人的原意、态度与语气。`;
-        break;
+  function onTranslationDelta(text) {
+    if (!text) return;
+    if (commitGraceTimer) { clearTimeout(commitGraceTimer); commitGraceTimer = null; }
+    // 若上一句已带句末标点，新 delta 说明下一句开始：先把上一句落成独立字幕行
+    if (currentTransBuffer && bufferEndsWithTerminal(currentTransBuffer)) {
+      commitCurrentLine(false, 'punctuation-next');
     }
-
-    return `${baseHeader}\n${domainModule}`;
+    lastTranscriptionAt = now();
+    lastServerMessageAt = lastTranscriptionAt;
+    currentTransBuffer += text;
+    renderStreamingLine();
+    maybeCommitByBoundary();
+    setDiagnostics({ LastTransAt: lastTranscriptionAt });
   }
 
-  /**
-   * High-performance Chunked Base64 encoder for TypedArrays.
-   * Avoids V8 maximum call stack size limits while eliminating per-character string allocation.
-   */
-  function uint8ToBase64(uint8Arr, byteLength) {
-    let binary = '';
-    const CHUNK_SIZE = 8192;
-    const view = uint8Arr.subarray(0, byteLength);
-    for (let i = 0; i < byteLength; i += CHUNK_SIZE) {
-      const chunk = view.subarray(i, Math.min(i + CHUNK_SIZE, byteLength));
-      binary += String.fromCharCode.apply(null, chunk);
+  function maybeCommitByBoundary() {
+    const mode = config.displayMode || 'bilingual';
+    const trans = currentTransBuffer.trim();
+    const orig = currentOrigBuffer.trim();
+
+    // 仅原文模式：按原文标点断句
+    if (mode === 'orig') {
+      if (!orig) return;
+      if (bufferEndsWithTerminal(currentOrigBuffer)) { commitCurrentLine(false, 'punctuation'); return; }
+      if (orig.length >= 90) commitCurrentLine(false, 'max-length');
+      return;
     }
-    return btoa(binary);
+
+    if (!trans) return;
+    if (trans.length >= 90) { commitCurrentLine(false, 'max-length'); return; }
+
+    const transEnded = bufferEndsWithTerminal(currentTransBuffer);
+    if (!transEnded) return;
+
+    // 仅译文模式：译文本句结束即提交
+    if (mode === 'trans') { commitCurrentLine(false, 'punctuation'); return; }
+
+    // 双语模式：优先等原文也结束；若译文已足够长（>=10 字）则直接提交，最多等 400ms
+    if (orig && !bufferEndsWithTerminal(currentOrigBuffer)) {
+      if (trans.length >= 10) { commitCurrentLine(false, 'punctuation-trans-only'); return; }
+      scheduleCommit('punctuation-wait-orig', 400);
+      return;
+    }
+    commitCurrentLine(false, 'punctuation');
   }
 
-  // 8. Non-Intrusive High-Fidelity Audio Capture Engine
-  let persistentAudioCtx = null;
+  // 静音断句：转写流停止一段时间后提交当前行（字幕不必等 turnComplete）
+  function startSilenceFlushTimer() {
+    if (silenceFlushTimer) clearInterval(silenceFlushTimer);
+    silenceFlushTimer = setInterval(() => {
+      if (!isRunning) return;
+      const idle = now() - lastTranscriptionAt;
+      if (idle > 1500 && (currentTransBuffer.trim() || currentOrigBuffer.trim())) {
+        const trans = currentTransBuffer.trim();
+        const orig = currentOrigBuffer.trim();
+        if (trans.length >= 3) commitCurrentLine(false, 'silence');
+        else if (!trans && orig.length >= 2 && idle > 4000) commitCurrentLine(true, 'silence-orig-only');
+      }
+      // 静止过久：清理多余的空行
+      if (idle > 30000 && currentStreamingEntry && !currentOrigBuffer && !currentTransBuffer) {
+        currentStreamingEntry.remove();
+        currentStreamingEntry = null;
+      }
+    }, 500);
+  }
 
-  function getOrCreateAudioGraph(video) {
+  // ========================================================================
+  // 6. 音频引擎
+  // ========================================================================
+
+  function findActiveVideo() {
+    const videos = Array.from(document.querySelectorAll('video'));
+    if (videos.length === 0) return null;
+    const playing = videos.find((v) => !v.paused && !v.ended && v.currentTime > 0);
+    return playing || videos[0];
+  }
+
+  function ensureAudioContext() {
     if (!persistentAudioCtx || persistentAudioCtx.state === 'closed') {
       persistentAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
     if (persistentAudioCtx.state === 'suspended') {
       persistentAudioCtx.resume().catch(() => {});
     }
-
-    let sourceNode = mediaSourceCache.get(video);
-    if (!sourceNode) {
-      sourceNode = persistentAudioCtx.createMediaElementSource(video);
-      // Lossless speaker passthrough to keep audio in sync with native video clock
-      sourceNode.connect(persistentAudioCtx.destination);
-      mediaSourceCache.set(video, sourceNode);
-    }
-    return { audioCtx: persistentAudioCtx, sourceNode };
+    return persistentAudioCtx;
   }
 
-  function findActiveVideo() {
-    const videos = Array.from(document.querySelectorAll('video'));
-    if (videos.length === 0) return null;
-    const playing = videos.find((v) => !v.paused && v.currentTime > 0);
-    return playing || videos[0];
+  function getOrCreateAudioGraph(video) {
+    const ctx = ensureAudioContext();
+    let sourceNode = mediaSourceCache.get(video);
+    if (!sourceNode) {
+      sourceNode = ctx.createMediaElementSource(video);
+      // 保持原声直通，避免用户听不到视频声音
+      sourceNode.connect(ctx.destination);
+      mediaSourceCache.set(video, sourceNode);
+    }
+    return { audioCtx: ctx, sourceNode };
   }
 
   function onVideoSeeking() {
-    if (isRunning) {
-      commitActiveSentence(true);
-    }
+    if (isRunning) commitCurrentLine(true, 'seek');
   }
 
   function onVideoPause() {
+    isVideoPaused = true;
     if (isRunning) {
-      commitActiveSentence(true);
-      if (statusText && !isConnecting) {
-        statusText.textContent = '⏸️ 视频已暂停';
-        statusText.style.color = '#94a3b8';
-      }
+      commitCurrentLine(true, 'pause');
+      if (!isConnectingUI) setStatus('info', '⏸️ 视频已暂停（会话保持）');
     }
   }
 
   function onVideoPlay() {
-    if (isRunning) {
-      if (persistentAudioCtx && persistentAudioCtx.state === 'suspended') {
-        persistentAudioCtx.resume().catch(() => {});
-      }
-    }
+    isVideoPaused = false;
+    if (!isRunning) return;
+    ensureAudioContext().resume().catch(() => {});
+    if (!isConnectingUI && activeSession && activeSession.state === 'ready') setStatus('ok', '🟢 正在同传');
   }
 
-  /**
-   * Dynamically rebinds audio pipeline to a newly detected active video element
-   * without interrupting WebSocket streaming session.
-   */
   function rebindActiveVideo(newVideo) {
     if (!isRunning || config.audioMode === 'mic' || !newVideo || newVideo === currentBoundVideo) return;
-    if (!audioCtx || !processorNode || !analyserNode) return;
-
+    if (!audioCtx || !processorNode || !analyserNode) {
+      currentBoundVideo = newVideo;
+      return;
+    }
     if (currentBoundVideo) {
       try {
         currentBoundVideo.removeEventListener('seeking', onVideoSeeking);
@@ -1339,7 +1219,6 @@ RULES:
         currentBoundVideo.removeEventListener('play', onVideoPlay);
       } catch (e) {}
     }
-
     currentBoundVideo = newVideo;
     newVideo.addEventListener('seeking', onVideoSeeking);
     newVideo.addEventListener('pause', onVideoPause);
@@ -1347,125 +1226,220 @@ RULES:
 
     const graph = getOrCreateAudioGraph(newVideo);
     audioCtx = graph.audioCtx;
-
-    if (audioSourceNode) {
-      try { audioSourceNode.disconnect(); } catch (e) {}
-      try { audioSourceNode.connect(audioCtx.destination); } catch (e) {}
-    }
-
+    try { audioSourceNode.disconnect(); } catch (e) {}
     audioSourceNode = graph.sourceNode;
-    audioSourceNode.connect(analyserNode);
-    audioSourceNode.connect(processorNode);
-
-    commitActiveSentence();
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume().catch(() => {});
-    }
+    try { audioSourceNode.connect(analyserNode); } catch (e) {}
+    try { audioSourceNode.connect(processorNode); } catch (e) {}
+    commitCurrentLine(true, 'video-switch');
+    ensureAudioContext().resume().catch(() => {});
   }
 
-  // Multi-Platform SPA Navigation & Dynamic Media Detection
+  // SPA 导航 / 视频切换
   let spaNavDebounce = null;
   function onSpaNavigationDetected() {
     if (!isRunning) return;
     if (spaNavDebounce) clearTimeout(spaNavDebounce);
     spaNavDebounce = setTimeout(() => {
-      if (isRunning) {
-        const newVideo = findActiveVideo();
-        if (newVideo && newVideo !== currentBoundVideo) {
-          rebindActiveVideo(newVideo);
-        }
-        // Update page context and domain if title or path mutated
-        const pageCtx = getPageContext();
-        domainText.textContent = pageCtx.domainLabel;
-        activeDomain = pageCtx.domain;
-      }
+      if (!isRunning) return;
+      const newVideo = findActiveVideo();
+      if (newVideo && newVideo !== currentBoundVideo) rebindActiveVideo(newVideo);
+      const pageCtx = getPageContext();
+      domainText.textContent = pageCtx.domainLabel;
+      activeDomain = pageCtx.domain;
     }, 400);
   }
 
-  // Intercept HTML5 History API (Bilibili, Netflix, Coursera, Twitter, Twitch, etc.)
   (function hookHistory() {
-    const origPushState = history.pushState;
-    const origReplaceState = history.replaceState;
-    history.pushState = function (...args) {
-      const ret = origPushState.apply(this, args);
-      window.dispatchEvent(new Event('locationchange'));
-      return ret;
-    };
-    history.replaceState = function (...args) {
-      const ret = origReplaceState.apply(this, args);
-      window.dispatchEvent(new Event('locationchange'));
-      return ret;
-    };
-    window.addEventListener('popstate', onSpaNavigationDetected);
-    window.addEventListener('locationchange', onSpaNavigationDetected);
-    window.addEventListener('yt-navigate-finish', onSpaNavigationDetected);
-
-    // Title mutation observer fallback for complex SPA frameworks
-    const titleEl = document.querySelector('title');
-    if (titleEl) {
-      const titleObserver = new MutationObserver(() => {
-        onSpaNavigationDetected();
-      });
-      titleObserver.observe(titleEl, { childList: true, characterData: true, subtree: true });
-    }
+    try {
+      const origPushState = history.pushState;
+      const origReplaceState = history.replaceState;
+      history.pushState = function (...args) {
+        const ret = origPushState.apply(this, args);
+        window.dispatchEvent(new Event('locationchange'));
+        return ret;
+      };
+      history.replaceState = function (...args) {
+        const ret = origReplaceState.apply(this, args);
+        window.dispatchEvent(new Event('locationchange'));
+        return ret;
+      };
+      window.addEventListener('popstate', onSpaNavigationDetected);
+      window.addEventListener('locationchange', onSpaNavigationDetected);
+      window.addEventListener('yt-navigate-finish', onSpaNavigationDetected);
+      const titleEl = document.querySelector('title');
+      if (titleEl && window.MutationObserver) {
+        new MutationObserver(onSpaNavigationDetected).observe(titleEl, { childList: true, characterData: true, subtree: true });
+      }
+    } catch (e) {}
   })();
 
-  // Global Video Play Event Listener (Capture Phase)
-  // Automatically detects when a new video starts playing without needing full session reset
   document.addEventListener('play', (e) => {
     if (isRunning && config.audioMode === 'video' && e.target && e.target.tagName === 'VIDEO') {
-      if (e.target !== currentBoundVideo) {
-        rebindActiveVideo(e.target);
-      }
+      if (e.target !== currentBoundVideo) rebindActiveVideo(e.target);
     }
   }, true);
 
-  // HTML5 Fullscreen Reparenting Support
-  // Reparents hostEl into document.fullscreenElement to overcome Top Layer rendering exclusion
-  function handleFullscreenChange() {
-    const fsElement = document.fullscreenElement || 
-                      document.webkitFullscreenElement || 
-                      document.mozFullScreenElement || 
-                      document.msFullscreenElement;
-    if (fsElement) {
-      if (hostEl.parentElement !== fsElement) {
-        fsElement.appendChild(hostEl);
+  window.addEventListener('pagehide', () => {
+    if (isRunning) stopSubtitleService(true);
+  });
+
+  // bfcache 返回页面时自动恢复
+  window.addEventListener('pageshow', (e) => {
+    if (e && e.persisted) {
+      ensureAudioContext().resume().catch(() => {});
+      if (overlay.style.display !== 'none' && !isRunning) startSubtitleService(true);
+    }
+  });
+
+  // ---- 流式重采样 ------------------------------------------------------
+
+  function resetResampler(nativeSampleRate) {
+    resampler.step = (nativeSampleRate || 48000) / 16000;
+    resampler.carryCount = 0;
+    resampler.phase = 0;
+    resampler.pendingCount = 0;
+  }
+
+  function resamplerSampleAt(idx, block, blockLen) {
+    if (idx >= 0) {
+      if (idx < blockLen) return block[idx];
+      return blockLen > 0 ? block[blockLen - 1] : 0;
+    }
+    const carryIdx = resampler.carryCount + idx;
+    if (carryIdx >= 0 && carryIdx < resampler.carryCount) return resampler.carry[carryIdx];
+    return 0;
+  }
+
+  /**
+   * 将任意长度、任意采样率的输入块流式重采样到 16kHz，
+   * 输出写入 resampler.pending（Int16，最多 4 个 100ms 块）。
+   * 返回本次产生的 16k 采样数。
+   */
+  function resampleBlock(input) {
+    const n = input.length;
+    if (!n) return 0;
+    const step = resampler.step;
+    let p = resampler.phase;
+    let produced = 0;
+
+    while (true) {
+      const idx = Math.floor(p);
+      if (idx >= n - 1) break;
+      const frac = p - idx;
+      let s0, s1;
+      if (idx < 0) {
+        s0 = resamplerSampleAt(idx, input, n);
+        s1 = input[0];
+      } else {
+        s0 = input[idx];
+        s1 = input[idx + 1];
       }
-    } else {
-      if (hostEl.parentElement !== document.body) {
-        document.body.appendChild(hostEl);
+      if (!Number.isFinite(s0)) s0 = 0;
+      if (!Number.isFinite(s1)) s1 = 0;
+      const sample = s0 + (s1 - s0) * frac;
+      const clamped = sample > 1 ? 1 : (sample < -1 ? -1 : sample);
+
+      if (resampler.pendingCount >= resampler.pending.length) break;
+      resampler.pending[resampler.pendingCount++] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+      produced++;
+      p += step;
+    }
+
+    // 保存最后两个采样作为下一块插值基准
+    if (n >= 2) {
+      resampler.carry[0] = input[n - 2];
+      resampler.carry[1] = input[n - 1];
+      resampler.carryCount = 2;
+    } else if (n === 1) {
+      resampler.carry[0] = resampler.carryCount > 0 ? resampler.carry[resampler.carryCount - 1] : input[0];
+      resampler.carry[1] = input[0];
+      resampler.carryCount = 2;
+    }
+    resampler.phase = p - n;
+    return produced;
+  }
+
+  function uint8ToBase64(uint8Arr, byteLength) {
+    let binary = '';
+    const chunkSize = 8192;
+    const view = uint8Arr.subarray(0, byteLength);
+    for (let i = 0; i < byteLength; i += chunkSize) {
+      const chunk = view.subarray(i, Math.min(i + chunkSize, byteLength));
+      binary += String.fromCharCode.apply(null, chunk);
+    }
+    return btoa(binary);
+  }
+
+  function buildAudioPayload(b64Audio) {
+    const style = config.audioFrameStyle === 'mediaChunks' ? 'mediaChunks' : 'audio';
+    if (style === 'mediaChunks') {
+      return `{"realtimeInput":{"mediaChunks":[{"mimeType":"audio/pcm;rate=16000","data":"${b64Audio}"}]}}`;
+    }
+    return `{"realtimeInput":{"audio":{"data":"${b64Audio}","mimeType":"audio/pcm;rate=16000"}}}`;
+  }
+
+  const audioSendQueue = []; // 握手期间的 100ms 音频块（base64）
+
+  function flushAudioQueue() {
+    if (!activeSession || activeSession.state !== 'ready' || activeSession.ws.readyState !== WebSocket.OPEN) return;
+    while (audioSendQueue.length && activeSession && activeSession.state === 'ready') {
+      const payload = audioSendQueue.shift();
+      try {
+        activeSession.ws.send(payload);
+        audioChunksSent++;
+        lastAudioSentAt = now();
+      } catch (e) {
+        audioSendQueue.unshift(payload);
+        break;
       }
     }
   }
 
-  document.addEventListener('fullscreenchange', handleFullscreenChange);
-  document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
-  document.addEventListener('mozfullscreenchange', handleFullscreenChange);
-  document.addEventListener('MSFullscreenChange', handleFullscreenChange);
-
-  // Clean shutdown on page unload / navigate away
-  window.addEventListener('pagehide', () => {
-    if (isRunning) {
-      stopSubtitleService(true);
+  function dispatchAudioChunk(b64Audio) {
+    const payload = buildAudioPayload(b64Audio);
+    const s = activeSession;
+    if (s && s.state === 'ready' && s.ws && s.ws.readyState === WebSocket.OPEN) {
+      // 背压保护：发送队列积压过多时丢弃最旧音频块，避免弱网下内存/延迟失控
+      if (s.ws.bufferedAmount > 1048576) {
+        droppedAudioChunks++;
+        setDiagnostics({ DroppedAudio: droppedAudioChunks });
+        return;
+      }
+      try {
+        s.ws.send(payload);
+        audioChunksSent++;
+        lastAudioSentAt = now();
+        if (audioChunksSent % 100 === 0) setDiagnostics({ AudioChunks: audioChunksSent });
+        return;
+      } catch (e) {
+        // 发送失败：降级为重连
+        scheduleReconnect('audio-send-error');
+      }
     }
-  });
+    // 握手/重连期间缓存少量音频，避免彻底断档
+    if (audioSendQueue.length < AUDIO_MAX_QUEUE_CHUNKS) audioSendQueue.push(payload);
+    else {
+      audioSendQueue.shift();
+      audioSendQueue.push(payload);
+    }
+  }
 
-  let activeSessionId = 0;
-  let sessionRotationTimer = null;
-  let isConnecting = false;
+  function consumePendingAudio() {
+    while (resampler.pendingCount >= AUDIO_CHUNK_SAMPLES) {
+      const chunkBytes = new Uint8Array(resampler.pending.buffer, 0, AUDIO_CHUNK_SAMPLES * 2);
+      const b64 = uint8ToBase64(chunkBytes, AUDIO_CHUNK_SAMPLES * 2);
+      dispatchAudioChunk(b64);
+      // 前移剩余采样
+      const remain = resampler.pendingCount - AUDIO_CHUNK_SAMPLES;
+      if (remain > 0) resampler.pending.copyWithin(0, AUDIO_CHUNK_SAMPLES, resampler.pendingCount);
+      resampler.pendingCount = remain;
+    }
+  }
 
-  /**
-   * Thoroughly cleans up all active audio nodes, intervals, and stops hardware microphone streams.
-   */
   function cleanupAudioPipeline() {
-    if (volumeCheckInterval) {
-      clearInterval(volumeCheckInterval);
-      volumeCheckInterval = null;
-    }
-    if (silenceFlushTimer) {
-      clearInterval(silenceFlushTimer);
-      silenceFlushTimer = null;
-    }
+    if (volumeCheckInterval) { clearInterval(volumeCheckInterval); volumeCheckInterval = null; }
+    if (audioResumeTimer) { clearInterval(audioResumeTimer); audioResumeTimer = null; }
+    if (videoWaitTimer) { clearInterval(videoWaitTimer); videoWaitTimer = null; }
     if (processorNode) {
       try { processorNode.disconnect(); } catch (e) {}
       processorNode.onaudioprocess = null;
@@ -1479,17 +1453,8 @@ RULES:
       try { analyserNode.disconnect(); } catch (e) {}
       analyserNode = null;
     }
-    // Hardening: Stop hardware microphone track immediately to release indicator & conserve power
     if (mediaStream) {
-      try {
-        mediaStream.getTracks().forEach((track) => {
-          if (track && typeof track.stop === 'function') {
-            track.stop();
-          }
-        });
-      } catch (e) {
-        console.warn('[Gemini Live] Failed to stop media stream tracks:', sanitizeErrorMessage(e));
-      }
+      try { mediaStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
       mediaStream = null;
     }
     if (currentBoundVideo) {
@@ -1502,88 +1467,72 @@ RULES:
     }
     if (audioSourceNode) {
       try { audioSourceNode.disconnect(); } catch (e) {}
-      // Restore lossless speaker passthrough for video element
       if (config.audioMode !== 'mic' && audioCtx && audioCtx.state !== 'closed') {
         try { audioSourceNode.connect(audioCtx.destination); } catch (e) {}
       }
       audioSourceNode = null;
     }
-    // Dedicated microphone AudioContext teardown
-    if (config.audioMode === 'mic' && audioCtx && audioCtx !== persistentAudioCtx) {
-      try {
-        if (audioCtx.state !== 'closed') {
-          audioCtx.close().catch(() => {});
-        }
-      } catch (e) {}
-      audioCtx = null;
+    if (config.audioMode === 'mic' && audioCtx && audioCtx !== persistentAudioCtx && audioCtx.state !== 'closed') {
+      try { audioCtx.close().catch(() => {}); } catch (e) {}
     }
+    if (config.audioMode === 'mic' || !isRunning) {
+      audioCtx = persistentAudioCtx && persistentAudioCtx.state !== 'closed' ? persistentAudioCtx : null;
+    }
+    audioPipelineReady = false;
+    resampler.pendingCount = 0;
+    audioSendQueue.length = 0;
+    renderVolume(0);
   }
 
-  async function initAudioCapture(sessionId) {
+  // 创建失败/不可捕获时抛出可重试错误
+  function makeRetryableError(message, code) {
+    const err = new Error(message);
+    err.retryable = true;
+    err.code = code || 'RETRYABLE';
+    return err;
+  }
+
+  async function initAudioCapture(session) {
     cleanupAudioPipeline();
 
     if (config.audioMode === 'mic') {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === 'suspended') await audioCtx.resume();
-
-      if (sessionId !== activeSessionId || !isRunning) {
-        if (audioCtx && audioCtx.state !== 'closed') {
-          audioCtx.close().catch(() => {});
-        }
-        audioCtx = null;
-        return;
+      if (audioCtx.state === 'suspended') {
+        try { await audioCtx.resume(); } catch (e) {}
       }
-
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false }
+          audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
         });
       } catch (micErr) {
-        if (audioCtx && audioCtx.state !== 'closed') {
-          audioCtx.close().catch(() => {});
-        }
+        try { if (audioCtx.state !== 'closed') audioCtx.close().catch(() => {}); } catch (e) {}
         audioCtx = null;
-        throw new Error('麦克风权限被拒绝或未找到音频输入设备: ' + (micErr.message || micErr));
+        throw new Error('麦克风权限被拒绝或未找到音频输入设备: ' + (micErr && micErr.message ? micErr.message : micErr));
       }
-
-      // Async session generation guard: ensure late-resolving getUserMedia tracks in an aborted session are immediately terminated and not leaked
-      if (sessionId !== activeSessionId || !isRunning) {
-        try {
-          stream.getTracks().forEach((track) => {
-            if (track && typeof track.stop === 'function') {
-              track.stop();
-            }
-          });
-        } catch (e) {}
-        if (audioCtx && audioCtx.state !== 'closed') {
-          audioCtx.close().catch(() => {});
-        }
+      if (session !== activeSession || !isRunning) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+        try { if (audioCtx.state !== 'closed') audioCtx.close().catch(() => {}); } catch (e) {}
         audioCtx = null;
         return;
       }
-
       mediaStream = stream;
       audioSourceNode = audioCtx.createMediaStreamSource(mediaStream);
     } else {
       const video = findActiveVideo();
-      if (!video) {
-        throw new Error('未找到正在播放的视频。请先点击播放视频。');
-      }
-
-      if (sessionId !== activeSessionId || !isRunning) return;
-
+      if (!video) throw makeRetryableError('未找到正在播放的视频。请先点击播放视频后再开启同传。', 'NO_VIDEO');
+      if (session !== activeSession || !isRunning) return;
       currentBoundVideo = video;
+      isVideoPaused = !!video.paused;
       video.addEventListener('seeking', onVideoSeeking);
       video.addEventListener('pause', onVideoPause);
       video.addEventListener('play', onVideoPlay);
-
       const graph = getOrCreateAudioGraph(video);
       audioCtx = graph.audioCtx;
       audioSourceNode = graph.sourceNode;
     }
 
-    if (sessionId !== activeSessionId || !isRunning) {
+    if (session !== activeSession || !isRunning) {
       cleanupAudioPipeline();
       return;
     }
@@ -1592,462 +1541,771 @@ RULES:
     analyserNode.fftSize = 256;
     audioSourceNode.connect(analyserNode);
 
-    const pcmVolumeData = new Uint8Array(analyserNode.frequencyBinCount);
+    const volumeData = new Uint8Array(analyserNode.frequencyBinCount);
     volumeCheckInterval = setInterval(() => {
       if (!isRunning || !analyserNode) return;
-      if (!ws || ws.readyState !== WebSocket.OPEN || isConnecting) return;
-      analyserNode.getByteFrequencyData(pcmVolumeData);
+      try {
+        analyserNode.getByteFrequencyData(volumeData);
+      } catch (e) { return; }
       let sum = 0;
-      for (let i = 0; i < pcmVolumeData.length; i++) sum += pcmVolumeData[i];
-      const avg = sum / pcmVolumeData.length;
-      if (avg > 2) {
-        statusText.textContent = `🎙️ 正在同传 (音量 ${Math.min(100, Math.round(avg * 2))}%)`;
-        statusText.style.color = '#34d399';
-      } else {
-        statusText.textContent = '⏳ 监听音频中...';
-        statusText.style.color = '#94a3b8';
-      }
+      for (let i = 0; i < volumeData.length; i++) sum += volumeData[i];
+      const avg = sum / volumeData.length;
+      renderVolume(avg);
+      if (avg > 6) lastSpeechAt = now();
+      setDiagnostics({ Volume: Math.round(avg) });
+      // 状态条由连接状态机独占写入，音量只更新音量条，避免“正在同传/监听音频中”闪烁
     }, 500);
 
-    // Natural sentence boundary flush timer (1400ms natural clause check, 3000ms force flush)
-    silenceFlushTimer = setInterval(() => {
-      if (isRunning && Date.now() - lastAudioTime > 1400) {
-        const isLongSilence = (Date.now() - lastAudioTime > 3000);
-        commitActiveSentence(isLongSilence);
+    // 每 1s 尝试恢复被系统挂起的 AudioContext
+    audioResumeTimer = setInterval(() => {
+      if (!isRunning || !audioCtx) return;
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
       }
-    }, 300);
+    }, 1000);
 
-    // Dynamic downsampling from Native SampleRate (44.1k/48k) to 16kHz PCM with Linear Interpolation
-    const bufferSize = 4096;
-    processorNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
-    const nativeSampleRate = audioCtx.sampleRate || 48000;
-    const targetSampleRate = 16000;
-    const sampleRatio = nativeSampleRate / targetSampleRate;
+    const nativeRate = audioCtx.sampleRate || 48000;
+    resetResampler(nativeRate);
 
+    // 优先 AudioWorklet（低抖动），失败回退 ScriptProcessor
+    processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
     processorNode.onaudioprocess = (e) => {
-      if (!isRunning || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-      const inputData = e.inputBuffer.getChannelData(0);
-      const outLength = Math.floor(inputData.length / sampleRatio);
-      if (outLength <= 0) return;
-
-      // High-fidelity linear interpolation resampler
-      for (let i = 0; i < outLength; i++) {
-        const srcPos = i * sampleRatio;
-        const idx0 = Math.floor(srcPos);
-        const idx1 = idx0 + 1 < inputData.length ? idx0 + 1 : inputData.length - 1;
-        const frac = srcPos - idx0;
-        const s0 = Number.isFinite(inputData[idx0]) ? inputData[idx0] : 0;
-        const s1 = Number.isFinite(inputData[idx1]) ? inputData[idx1] : 0;
-        const sample = (1 - frac) * s0 + frac * s1;
-        const clamped = Math.max(-1, Math.min(1, sample));
-        reusablePcm16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
-      }
-
-      const byteLength = outLength * 2;
-      const b64Audio = uint8ToBase64(reusableUint8, byteLength);
-      const payload = `{"realtimeInput":{"mediaChunks":[{"mimeType":"audio/pcm;rate=16000","data":"${b64Audio}"}]}}`;
-
+      if (!isRunning) return;
       try {
-        ws.send(payload);
-      } catch (err) {}
+        const input = e.inputBuffer.getChannelData(0);
+        resampleBlock(input);
+        consumePendingAudio();
+      } catch (err) {
+        console.error('[Gemini Live] Audio process error:', sanitizeErrorMessage(err));
+      }
     };
 
     audioSourceNode.connect(processorNode);
-
-    // Muted GainNode passthrough keeps processorNode active without speaker pops
     mutedGainNode = audioCtx.createGain();
     mutedGainNode.gain.value = 0;
     processorNode.connect(mutedGainNode);
     mutedGainNode.connect(audioCtx.destination);
+
+    audioPipelineReady = true;
+    setDiagnostics({ SampleRate: nativeRate, AudioPipeline: 'running' });
+    startSilenceFlushTimer();
   }
 
-  // 9. Smart WebSocket URL Builder (Decoupled: Supports Official Google API & Custom Proxies)
+  // ========================================================================
+  // 7. WebSocket 会话管理（原生 Live Translate 协议）
+  // ========================================================================
+
   function getWebSocketUrl() {
-    let host = (config.apiHost || 'https://generativelanguage.googleapis.com').trim();
-    
-    // Normalize protocol
-    if (host.startsWith('http://')) {
-      host = 'ws://' + host.substring(7);
-    } else if (host.startsWith('https://')) {
-      host = 'wss://' + host.substring(8);
-    } else if (!host.startsWith('ws://') && !host.startsWith('wss://')) {
-      host = 'wss://' + host;
-    }
+    let host = String(config.apiHost || DEFAULT_CONFIG.apiHost).trim() || DEFAULT_CONFIG.apiHost;
+    if (/^http:\/\//i.test(host)) host = 'ws://' + host.substring(7);
+    else if (/^https:\/\//i.test(host)) host = 'wss://' + host.substring(8);
+    else if (!/^wss?:\/\//i.test(host)) host = 'wss://' + host;
 
-    // Clean standard REST trailing paths
-    host = host.replace(/\/v1beta\/models\/?$/, '')
-               .replace(/\/v1beta\/?$/, '')
-               .replace(/\/models\/?$/, '')
-               .replace(/\/+$/, '');
+    host = host.replace(/\/+$/, '')
+      .replace(/\/v1beta\/models\/?$/i, '')
+      .replace(/\/v1beta\/?$/i, '')
+      .replace(/\/models\/?$/i, '');
 
-    // Append Google BidiGenerateContent WebSocket service path if not already included
-    if (!host.includes('/ws/google.ai.generativelanguage.')) {
+    if (!/\/ws\/google\.ai\.generativelanguage\./i.test(host)) {
       host += '/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
     }
 
-    // Append API Key query parameter if provided
-    if (config.apiKey && config.apiKey.trim()) {
-      const separator = host.includes('?') ? '&' : '?';
-      host += `${separator}key=${encodeURIComponent(config.apiKey.trim())}`;
+    if (config.apiKey && String(config.apiKey).trim() && !/[?&]key=/.test(host)) {
+      host += (host.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(String(config.apiKey).trim());
     }
     return host;
   }
 
-  async function startSubtitleService(isManualStart = true) {
-    if (isManualStart) {
-      reconnectAttempts = 0;
-      isManualDisconnect = false;
+  function buildSetupPayload() {
+    const model = normalizeModelName(config.model);
+    const useLegacy = isLiveTranslateModel(model) && config.protocolMode === 'legacy';
+
+    if (useLegacy) {
+      // 兼容模式：真机 E2E 验证可连续同传的载荷（v1.0.4 形态 + 语境/目标语言系统提示词）
+      const legacyPrompt = `${buildDynamicSystemPrompt(getPageContext())}\n\n[MODE]: Real-time simultaneous interpretation of the incoming audio. Output ONLY the translated text in the target language, continuously, without waiting for turns.`;
+      return {
+        setup: {
+          model,
+          generationConfig: {
+            responseModalities: [config.responseModality === 'AUDIO' ? 'AUDIO' : 'TEXT'],
+            temperature: 0.3
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          contextWindowCompression: { slidingWindow: {} },
+          systemInstruction: { parts: [{ text: legacyPrompt }] }
+        }
+      };
     }
 
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
+    if (isLiveTranslateModel(model)) {
+      return {
+        setup: {
+          model,
+          generationConfig: {
+            responseModalities: [config.responseModality === 'TEXT' ? 'TEXT' : 'AUDIO'],
+            translationConfig: {
+              targetLanguageCode: getBcp47LanguageCode(config.targetLang),
+              echoTargetLanguage: true
+            }
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          // contextWindowCompression 实测被服务端接受且无害，保留作为优化；
+          // 但不能稳定消除长会话退化（同配置多连接产出方差 2~118 条/120s，主因疑似网关上上游 Key 质量）。
+          // 真正兜底是上面的看门狗：有语音却长期无转写/译文 → 重连换 Key。
+          contextWindowCompression: { slidingWindow: {} }
+        }
+      };
     }
 
-    if (connectTimeoutTimer) {
-      clearTimeout(connectTimeoutTimer);
-      connectTimeoutTimer = null;
+    const payload = {
+      setup: {
+        model,
+        generationConfig: {
+          responseModalities: ['TEXT'],
+          temperature: 0.3
+        },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {}
+      }
+    };
+    const prompt = buildDynamicSystemPrompt(getPageContext());
+    if (prompt) payload.setup.systemInstruction = { parts: [{ text: prompt }] };
+    return payload;
+  }
+
+  function createSession(reason) {
+    return {
+      id: ++sessionSeq,
+      reason: reason || 'connect',
+      ws: null,
+      state: 'connecting', // connecting | ready | closed
+      createdAt: now(),
+      openedAt: 0,
+      readyAt: 0,
+      lastServerMsgAt: 0,
+      lastTranscriptionAt: 0,
+      lastOrigAt: 0,
+      lastOutAt: 0,
+      connectTimer: null,
+      rotationTimer: null,
+      intentionallyClosed: false
+    };
+  }
+
+  function clearSessionTimers(session) {
+    if (!session) return;
+    if (session.connectTimer) { clearTimeout(session.connectTimer); session.connectTimer = null; }
+    if (session.rotationTimer) { clearTimeout(session.rotationTimer); session.rotationTimer = null; }
+  }
+
+  function closeSession(session, reason) {
+    if (!session) return;
+    session.intentionallyClosed = true;
+    clearSessionTimers(session);
+    const sock = session.ws;
+    session.ws = null;
+    session.state = 'closed';
+    if (sock) {
+      sock.onopen = null;
+      sock.onmessage = null;
+      sock.onerror = null;
+      sock.onclose = null;
+      try { sock.close(1000, reason || 'close'); } catch (e) {}
     }
+  }
 
-    // Teardown any dangling old session
-    if (ws || processorNode || analyserNode) {
-      stopSubtitleService(false);
-    }
+  function sessionLog(prefix, session, extra) {
+    const ts = new Date().toISOString().substring(11, 23);
+    console.log(`[Gemini Live ${ts}] ${prefix}`, JSON.stringify(Object.assign({
+      session: session ? session.id : null,
+      reason: session ? session.reason : null,
+      state: session ? session.state : null
+    }, extra || {})));
+  }
 
-    const currentSession = ++activeSessionId;
-    isRunning = true;
-    isConnecting = true;
-
-    btnToggle.classList.add('active');
-    btnToggleIcon.innerHTML = `<rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect>`;
-    statusText.textContent = '🔄 连接中...';
-    statusText.style.color = '#38bdf8';
-
+  function connectSession(session, options) {
+    if (!session || !isRunning) return;
+    const opts = options || {};
+    const silent = !!opts.silent; // 轮转备用会话：不抢占状态条文案
+    let url;
     try {
-      const wsUrl = getWebSocketUrl();
+      url = getWebSocketUrl();
+    } catch (e) {
+      setStatus('err', '❌ 节点地址无效: ' + sanitizeErrorMessage(e));
+      return;
+    }
 
-      // Check if official Google API is selected without an API Key
-      if (wsUrl.includes('generativelanguage.googleapis.com') && (!config.apiKey || !config.apiKey.trim())) {
-        statusText.textContent = '❌ 请在设置中填写 Google API Key';
-        statusText.style.color = '#ef4444';
-        stopSubtitleService(true);
-        return;
+    if (/generativelanguage\.googleapis\.com/i.test(url) && (!config.apiKey || !String(config.apiKey).trim())) {
+      setStatus('err', '❌ 官方 API 需要填写 Google API Key');
+      stopSubtitleService(true);
+      return;
+    }
+
+    if (!silent) {
+      isConnectingUI = true;
+      setStatus('info', `🔗 连接中… (会话 #${session.id})`);
+      setDiagnostics({ Session: session.id, Connects: session.id });
+    } else {
+      sessionLog('Standby session connecting', session);
+    }
+
+    let sock;
+    try {
+      sock = new WebSocket(url);
+    } catch (e) {
+      sessionLog('WS construct failed', session, { error: sanitizeErrorMessage(e) });
+      setStatus('err', '❌ WebSocket 创建失败: ' + sanitizeErrorMessage(e && e.message ? e.message : e));
+      scheduleReconnect('construct-failed');
+      return;
+    }
+    session.ws = sock;
+
+    session.connectTimer = setTimeout(() => {
+      if (session.state === 'closed') return;
+      if (session.state === 'connecting') {
+        sessionLog('Connect/handshake timeout', session, { timeoutMs: CONNECT_TIMEOUT_MS });
+        setStatus('warn', '⚠️ 握手超时，正在重试…');
+        closeSession(session, 'handshake-timeout');
+        if (session === activeSession || !activeSession) scheduleReconnect('handshake-timeout');
+        else if (session === standbySession) standbySession = null;
       }
+    }, CONNECT_TIMEOUT_MS);
 
-      if (connectTimeoutTimer) {
-        clearTimeout(connectTimeoutTimer);
-        connectTimeoutTimer = null;
-      }
-      connectTimeoutTimer = setTimeout(() => {
-        if (currentSession !== activeSessionId) return;
-        if (!ws || ws.readyState !== WebSocket.OPEN || isConnecting) {
-          console.warn('[Gemini Live Translator] Connection / handshake timed out (12s).');
-          statusText.textContent = '⚠️ 连接超时，正在重试...';
-          statusText.style.color = '#f59e0b';
-          try { if (ws) ws.close(); } catch (e) {}
-        }
-      }, 12000);
-
-      console.log('[Gemini Live Translator] Connecting to:', sanitizeUrl(wsUrl));
-      let currentWs;
+    sock.onopen = () => {
+      if (session.state === 'closed' || !isRunning) return;
+      session.openedAt = now();
+      sessionLog('WebSocket opened', session, { handshakeMs: session.openedAt - session.createdAt });
+      let payload;
       try {
-        currentWs = new WebSocket(wsUrl);
-        ws = currentWs;
-      } catch (constructErr) {
-        console.error('[Gemini Live] WebSocket creation failed:', sanitizeErrorMessage(constructErr));
-        statusText.textContent = '❌ WebSocket 创建失败: ' + sanitizeErrorMessage(constructErr.message || constructErr);
-        statusText.style.color = '#ef4444';
+        payload = buildSetupPayload();
+      } catch (e) {
+        setStatus('err', '❌ 会话配置构造失败: ' + sanitizeErrorMessage(e));
+        closeSession(session, 'setup-error');
+        return;
+      }
+      try {
+        sock.send(JSON.stringify(payload));
+        sessionLog('Setup sent', session, { model: payload.setup.model, engine: isLiveTranslateModel(payload.setup.model) ? 'translate' : 'agent' });
+        if (!silent) setStatus('info', '⚙️ 初始化会话…');
+      } catch (e) {
+        setStatus('err', '❌ 发送 setup 失败: ' + sanitizeErrorMessage(e));
+        closeSession(session, 'setup-send-error');
+        scheduleReconnect('setup-send-error');
+      }
+    };
+
+    sock.onmessage = (event) => {
+      // 异步解析 Blob
+      if (typeof event.data === 'string') {
+        handleServerMessage(session, event.data);
+      } else if (event.data && typeof event.data.text === 'function') {
+        event.data.text().then((t) => handleServerMessage(session, t)).catch((e) => sessionLog('Blob decode error', session, { error: String(e) }));
+      } else if (event.data instanceof ArrayBuffer) {
+        try { handleServerMessage(session, new TextDecoder().decode(event.data)); } catch (e) {}
+      }
+    };
+
+    sock.onerror = () => {
+      sessionLog('WebSocket error event', session);
+    };
+
+    sock.onclose = (event) => {
+      sessionLog('WebSocket closed', session, { code: event.code, reason: sanitizeErrorMessage(event.reason || ''), wasReady: !!session.readyAt });
+      clearSessionTimers(session);
+      const wasActive = session === activeSession;
+      const wasStandby = session === standbySession;
+      session.state = 'closed';
+      session.ws = null;
+
+      if (session.intentionallyClosed) return;
+
+      if (wasStandby) {
+        standbySession = null;
+        sessionLog('Standby rotation failed, keeping current session', session);
+        return; // 放弃轮转，保留当前主会话
+      }
+
+      if (!wasActive) return;
+
+      // 主会话意外断开
+      isConnectingUI = false;
+      if (!isRunning) return;
+      if (event.code === 1000 && !event.reason) {
+        sessionLog('Normal close while running → reconnect', session);
+      }
+      scheduleReconnect(`close-${event.code}`);
+    };
+  }
+
+  function handleServerMessage(session, rawText) {
+    if (!rawText) return;
+    if (session.state === 'closed') return;
+    let msg;
+    try {
+      msg = JSON.parse(rawText);
+    } catch (e) {
+      sessionLog('JSON parse error', session, { error: sanitizeErrorMessage(e) });
+      return;
+    }
+
+    const t = now();
+    session.lastServerMsgAt = t;
+    lastServerMessageAt = t;
+    if (msg.setupComplete !== undefined) {
+      session.state = 'ready';
+      session.readyAt = t;
+      clearSessionTimers(session);
+      sessionLog('setupComplete', session, { setupMs: t - session.createdAt });
+      reconnectAttempts = 0;
+      isConnectingUI = false;
+      onSessionReady(session);
+      return;
+    }
+
+    if (msg.error) {
+      const errMsg = msg.error.message || JSON.stringify(msg.error);
+      sessionLog('Server error', session, { code: msg.error.code, message: sanitizeErrorMessage(errMsg) });
+      if (session !== activeSession) {
+        // 备用/旧会话的错误不应影响主会话与整体服务
+        closeSession(session, 'standby-error');
+        if (session === standbySession) standbySession = null;
+        return;
+      }
+      if (isTerminalError(msg.error.code, errMsg)) {
+        setStatus('err', '❌ API 错误: ' + sanitizeErrorMessage(errMsg).slice(0, 120));
         stopSubtitleService(true);
+        closeSession(session, 'terminal-error');
+      } else {
+        setStatus('warn', '⚠️ 服务端异常: ' + sanitizeErrorMessage(errMsg).slice(0, 80));
+      }
+    }
+
+    if (msg.goAway) {
+      const timeLeft = Number(msg.goAway.timeLeft || 0);
+      sessionLog('goAway received', session, { timeLeft });
+      setDiagnostics({ GoAway: timeLeft || 'unknown' });
+      scheduleRotation(session, 'go-away', Math.max(0, timeLeft * 1000 - 1500));
+    }
+
+    // 备用/过期会话一律不渲染字幕，避免轮转期间出现重复内容
+    if (session !== activeSession) return;
+
+    const sc = msg.serverContent;
+    if (!sc) return;
+
+    if (sc.interrupted) {
+      commitCurrentLine(true, 'interrupted');
+    }
+
+    if (sc.inputTranscription && sc.inputTranscription.text) {
+      session.lastTranscriptionAt = t;
+      session.lastOrigAt = t;
+      if (config.displayMode !== 'trans') onOriginalDelta(sc.inputTranscription.text);
+      else lastTranscriptionAt = t;
+    }
+
+    let handled = false;
+    if (sc.outputTranscription && sc.outputTranscription.text) {
+      session.lastTranscriptionAt = t;
+      session.lastOutAt = t;
+      if (config.displayMode !== 'orig') onTranslationDelta(sc.outputTranscription.text);
+      else lastTranscriptionAt = t;
+      handled = true;
+    }
+    if (sc.outputAudioTranscription && sc.outputAudioTranscription.text) {
+      session.lastTranscriptionAt = t;
+      session.lastOutAt = t;
+      if (config.displayMode !== 'orig') onTranslationDelta(sc.outputAudioTranscription.text);
+      else lastTranscriptionAt = t;
+      handled = true;
+    }
+    if (!handled && sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
+      for (let i = 0; i < sc.modelTurn.parts.length; i++) {
+        const part = sc.modelTurn.parts[i];
+        if (part && part.text) {
+          session.lastTranscriptionAt = t;
+          if (config.displayMode !== 'orig') onTranslationDelta(part.text);
+          else lastTranscriptionAt = t;
+        }
+        if (part && part.inlineData) {
+          inlineAudioChunks++;
+          if (inlineAudioChunks % 20 === 1) setDiagnostics({ InlineAudio: inlineAudioChunks });
+        }
+      }
+    }
+
+    if (sc.turnComplete || sc.generationComplete) {
+      commitCurrentLine(true, 'turn-complete');
+    }
+  }
+
+  function onSessionReady(session) {
+    const isStandby = session === standbySession;
+
+    if (isStandby) {
+      // 无缝轮转：新会话就绪后再切换，旧会话无缝退场
+      const old = activeSession;
+      activeSession = session;
+      standbySession = null;
+      session.rotationTimer = null;
+      sessionLog('Rotation promoted', session, { previousSession: old ? old.id : null });
+      if (old) closeSession(old, 'rotated-out');
+    } else {
+      activeSession = session;
+    }
+
+    setStatus('ok', '🟢 正在同传');
+    setDiagnostics({ Session: session.id, LastReadyAt: now() });
+    renderVolume(0);
+
+    // 首次就绪：初始化音频采集；轮转时音频管线已在运行，直接切换即可
+    if (!audioPipelineReady) {
+      initAudioCapture(session).then(() => {
+        if (session !== activeSession || !isRunning) return;
+        flushAudioQueue();
+        setStatus('ok', '🟢 正在同传');
+        setDiagnostics({ AudioPipeline: 'running' });
+      }).catch((audioErr) => {
+        sessionLog('Audio capture failed', session, { error: sanitizeErrorMessage(audioErr), retryable: !!(audioErr && audioErr.retryable) });
+        if (audioErr && audioErr.retryable && isRunning && session === activeSession) {
+          // 视频尚未就绪 / 可恢复错误：等待播放后自动重试，而不是直接停服
+          waitForVideoAndInit(session);
+          return;
+        }
+        setStatus('err', '❌ 音频启动失败: ' + sanitizeErrorMessage(audioErr && audioErr.message ? audioErr.message : audioErr));
+        stopSubtitleService(true);
+      });
+    } else {
+      flushAudioQueue();
+    }
+
+    // 预防性轮转（长会话）
+    scheduleRotation(session, 'periodic', SESSION_ROTATE_MS);
+  }
+
+  /**
+   * 视频尚未就绪（用户先开字幕、后点播放）时的等待重试循环。
+   * 只要服务仍在运行且会话仍是当前会话，就每 1.5s 尝试一次，直到成功或用户停止。
+   */
+  function waitForVideoAndInit(session) {
+    if (videoWaitTimer) clearInterval(videoWaitTimer);
+    setStatus('info', '⏳ 等待视频开始播放…（播放后自动开始同传）');
+    setDiagnostics({ AudioPipeline: 'waiting-video' });
+    videoWaitTimer = setInterval(() => {
+      if (!isRunning || session !== activeSession) {
+        clearInterval(videoWaitTimer);
+        videoWaitTimer = null;
+        return;
+      }
+      const video = findActiveVideo();
+      if (!video || video.paused) return;
+      clearInterval(videoWaitTimer);
+      videoWaitTimer = null;
+      initAudioCapture(session).then(() => {
+        if (session !== activeSession || !isRunning) return;
+        flushAudioQueue();
+        setStatus('ok', '🟢 正在同传');
+        setDiagnostics({ AudioPipeline: 'running' });
+      }).catch((err) => {
+        sessionLog('Audio capture retry failed', session, { error: sanitizeErrorMessage(err), retryable: !!(err && err.retryable) });
+        if (err && err.retryable && isRunning) {
+          waitForVideoAndInit(session);
+        } else {
+          setStatus('err', '❌ 音频启动失败: ' + sanitizeErrorMessage(err && err.message ? err.message : err));
+          stopSubtitleService(true);
+        }
+      });
+    }, 1500);
+  }
+
+  function scheduleRotation(session, reason, delayMs) {    if (!session || session !== activeSession) return;
+    if (session.rotationTimer) clearTimeout(session.rotationTimer);
+    const delay = Math.max(2000, delayMs || SESSION_ROTATE_MS);
+    session.rotationTimer = setTimeout(() => {
+      session.rotationTimer = null;
+      if (!isRunning || session !== activeSession) return;
+      if (standbySession) return;
+      sessionLog('Starting standby rotation', session, { reason });
+      setDiagnostics({ RotationReason: reason });
+      const standby = createSession('rotation');
+      standbySession = standby;
+      connectSession(standby, { silent: true });
+    }, delay);
+  }
+
+  function scheduleReconnect(reason) {
+    if (!isRunning) return;
+    if (reconnectTimer) return; // 已在重连计划中
+    if (isConnectingUI) isConnectingUI = false;
+
+    reconnectAttempts++;
+    const delay = calculateBackoffDelay(reconnectAttempts - 1);
+    setDiagnostics({ Reconnects: reconnectAttempts, ReconnectReason: reason });
+    setStatus('warn', `🔄 连接断开，${(delay / 1000).toFixed(1)}s 后重连（第 ${reconnectAttempts} 次）`);
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (!isRunning) return;
+      if (activeSession && activeSession.state === 'ready') return; // 已恢复
+      const session = createSession('reconnect');
+      connectSession(session);
+    }, delay);
+  }
+
+  function manualRestart(reason) {
+    if (!isRunning) return;
+    sessionLog('Manual restart', activeSession, { reason });
+    commitCurrentLine(true, 'restart');
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (commitGraceTimer) { clearTimeout(commitGraceTimer); commitGraceTimer = null; }
+    if (standbySession) { closeSession(standbySession, 'restart'); standbySession = null; }
+    if (activeSession) { closeSession(activeSession, 'restart'); activeSession = null; }
+    audioSendQueue.length = 0;
+    reconnectAttempts = 0;
+    isConnectingUI = false;
+    updateToggleIcon(true);
+    setStatus('info', '🔄 正在重新连接…');
+    setDiagnostics({ Reconnects: 0, Session: 0 });
+    startWatchdog();
+    startSilenceFlushTimer();
+    setTimeout(() => {
+      if (!isRunning) return;
+      connectSession(createSession('manual-restart'));
+    }, 120);
+  }
+
+  function updateToggleIcon(running) {
+    if (!btnToggle || !btnToggleIcon) return;
+    if (running) {
+      btnToggle.classList.add('active');
+      btnToggleIcon.innerHTML = '<rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect>';
+    } else {
+      btnToggle.classList.remove('active');
+      btnToggleIcon.innerHTML = '<polygon points="5 3 19 12 5 21 5 3"></polygon>';
+    }
+  }
+
+  // ---- 看门狗 ----------------------------------------------------------
+
+  function startWatchdog() {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    watchdogTimer = setInterval(() => {
+      if (!isRunning) return;
+
+      // 未连接且没有重连计划 → 兜底重连
+      if (!activeSession || activeSession.state === 'closed') {
+        if (!reconnectTimer && !isConnectingUI) scheduleReconnect('watchdog-no-session');
         return;
       }
 
-      currentWs.onopen = () => {
-        if (currentSession !== activeSessionId) {
-          try { currentWs.close(); } catch (e) {}
-          return;
-        }
-
-        console.log('[Gemini Live Translator] WebSocket connected! Sending setup payload for:', config.model);
-        statusText.textContent = '初始化会话...';
-        statusText.style.color = '#34d399';
-
-        const pageCtx = getPageContext();
-        domainText.textContent = pageCtx.domainLabel;
-        activeDomain = pageCtx.domain;
-
-        const dynamicPrompt = buildDynamicSystemPrompt(pageCtx);
-        const setupPayload = {
-          setup: {
-            model: config.model,
-            generationConfig: {
-              responseModalities: ['TEXT'],
-              temperature: 0.3
-            },
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            systemInstruction: {
-              parts: [{ text: dynamicPrompt }]
-            }
-          }
-        };
-
-        currentWs.send(JSON.stringify(setupPayload));
-      };
-
-      currentWs.onmessage = async (e) => {
-        if (currentSession !== activeSessionId) return;
-
-        let text = '';
-        if (typeof e.data === 'string') {
-          text = e.data;
-        } else if (e.data instanceof Blob) {
-          text = await e.data.text();
-        } else if (e.data instanceof ArrayBuffer) {
-          text = new TextDecoder().decode(e.data);
-        }
-
-        try {
-          const msg = JSON.parse(text);
-
-          // 1. Server Error Payload Detection & Terminal Error Handling
-          if (msg.error) {
-            const errObj = msg.error;
-            const errCode = errObj.code || 0;
-            const errMsg = errObj.message || JSON.stringify(errObj);
-            console.error('[Gemini Live Translator] Server returned error:', sanitizeErrorMessage(errMsg));
-
-            if (isTerminalError(errCode, errMsg)) {
-              statusText.textContent = '❌ API 错误: ' + sanitizeErrorMessage(errMsg);
-              statusText.style.color = '#ef4444';
-              stopSubtitleService(true);
-              return;
-            } else {
-              statusText.textContent = '⚠️ API 异常: ' + sanitizeErrorMessage(errMsg);
-              statusText.style.color = '#f59e0b';
-            }
-          }
-
-          // 2. Setup Complete Handshake Acknowledgement
-          if (msg.setupComplete !== undefined) {
-            if (connectTimeoutTimer) {
-              clearTimeout(connectTimeoutTimer);
-              connectTimeoutTimer = null;
-            }
-            console.log('[Gemini Live Translator] Handshake complete (setupComplete ACK received).');
-            reconnectAttempts = 0; // Handshake successful, reset reconnect backoff count
-            try {
-              await initAudioCapture(currentSession);
-              if (currentSession !== activeSessionId || !isRunning) return;
-              isConnecting = false;
-              statusText.textContent = '🎙️ 实时翻译中';
-              statusText.style.color = '#34d399';
-            } catch (audioErr) {
-              console.error('[Gemini Live] Audio capture failed:', sanitizeErrorMessage(audioErr));
-              statusText.textContent = '❌ 音频启动失败: ' + sanitizeErrorMessage(audioErr.message || audioErr);
-              statusText.style.color = '#ef4444';
-              stopSubtitleService(true);
-              return;
-            }
-          }
-
-          // 3. Multimodal Live Server Content & Signal Processing
-          if (msg.serverContent) {
-            const sc = msg.serverContent;
-
-            // Signal A: Interruption Event (User interrupted or audio stream reset)
-            if (sc.interrupted) {
-              commitActiveSentence(true);
-            }
-
-            // Signal B: Original Input Audio Transcription
-            if (sc.inputTranscription && sc.inputTranscription.text) {
-              handleIncomingOriginalChunk(sc.inputTranscription.text);
-            }
-
-            // Signal C: Output Translation Stream (Real-time Streaming Text)
-            let handledTranslatedText = false;
-            if (sc.outputTranscription && sc.outputTranscription.text) {
-              handleIncomingTranslatedChunk(sc.outputTranscription.text);
-              handledTranslatedText = true;
-            }
-            if (sc.outputAudioTranscription && sc.outputAudioTranscription.text) {
-              handleIncomingTranslatedChunk(sc.outputAudioTranscription.text);
-              handledTranslatedText = true;
-            }
-            if (!handledTranslatedText && sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
-              for (const part of sc.modelTurn.parts) {
-                if (part && part.text) {
-                  handleIncomingTranslatedChunk(part.text);
-                }
-              }
-            }
-
-            // Signal D: Sentence or Turn Completion Boundary
-            if (sc.turnComplete || sc.generationComplete) {
-              commitActiveSentence(true);
-            }
-          }
-        } catch (err) {
-          console.error('[Gemini Live Translator] Parse error:', sanitizeErrorMessage(err));
-        }
-      };
-
-      sessionRotationTimer = setInterval(() => {
-        if (isRunning && currentSession === activeSessionId && ws === currentWs && ws.readyState === WebSocket.OPEN) {
-          console.log('[Gemini Live Translator] Periodic session refresh...');
-          restartSession();
-        }
-      }, 10 * 60 * 1000);
-
-      currentWs.onerror = (e) => {
-        if (currentSession !== activeSessionId) return;
-        statusText.textContent = '连接异常';
-        statusText.style.color = '#ef4444';
-      };
-
-      currentWs.onclose = (e) => {
-        if (currentSession !== activeSessionId) return; // Stale session closed, ignore
-        if (sessionRotationTimer) {
-          clearInterval(sessionRotationTimer);
-          sessionRotationTimer = null;
-        }
-
-        if (isManualDisconnect) {
-          return;
-        }
-
-        // Terminal error close check
-        if (isTerminalError(e.code, e.reason)) {
-          console.warn(`[Gemini Live] Terminal close code: ${e.code}, reason: ${sanitizeErrorMessage(e.reason || 'None')}`);
-          statusText.textContent = '❌ 认证或权限异常，请检查 API Key';
-          statusText.style.color = '#ef4444';
-          stopSubtitleService(true);
-          return;
-        }
-
-        if (isRunning) {
-          if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            console.warn(`[Gemini Live] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Halting auto-reconnect.`);
-            statusText.textContent = '❌ 连接重试超限，请检查网络或配置';
-            statusText.style.color = '#ef4444';
-            stopSubtitleService(true);
+      const s = activeSession;
+      if (s.state === 'ready') {
+        // 视频暂停期间跳过"无转写/服务端静默"看门狗，避免暂停时反复重建会话；恢复播放后会重新计时
+        const paused = config.audioMode === 'video' && isVideoPaused;
+        if (!paused) {
+          const serverIdle = now() - (s.lastServerMsgAt || s.readyAt || now());
+          if (serverIdle > SERVER_SILENCE_RECONNECT_MS) {
+            sessionLog('Watchdog: server silent too long', s, { serverIdle });
+            forceReconnect('server-silent');
             return;
           }
-
-          const delay = calculateBackoffDelay(reconnectAttempts);
-          reconnectAttempts++;
-          const currentAttempt = reconnectAttempts;
-          console.log(`[Gemini Live Translator] Connection closed (code: ${e.code}). Reconnecting in ${delay}ms (attempt ${currentAttempt}/${MAX_RECONNECT_ATTEMPTS})...`);
-          statusText.textContent = `🔄 连接断开，${Math.round(delay / 1000)}秒后重试 (${currentAttempt}/${MAX_RECONNECT_ATTEMPTS})...`;
-          statusText.style.color = '#38bdf8';
-
-          reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            if (isRunning && !isManualDisconnect && currentSession === activeSessionId) {
-              startSubtitleService(false);
-            }
-          }, delay);
-        } else {
-          stopSubtitleService();
+          const speechActive = now() - lastSpeechAt < 8000;
+          const transcribeIdle = now() - (s.lastTranscriptionAt || s.readyAt || now());
+          if (speechActive && transcribeIdle > NO_TRANSCRIPTION_RECONNECT_MS) {
+            sessionLog('Watchdog: speech but no transcription', s, { transcribeIdle });
+            forceReconnect('no-transcription');
+            return;
+          }
+          // 原文在流动但译文停摆（翻译流单独卡死）→ 重连换上游
+          const origActive = now() - (s.lastOrigAt || 0) < 10000;
+          const outIdle = now() - (s.lastOutAt || s.readyAt || now());
+          if (origActive && s.lastOutAt && outIdle > NO_TRANSLATION_RECONNECT_MS) {
+            sessionLog('Watchdog: transcription flowing but translation stalled', s, { outIdle });
+            forceReconnect('translation-stall');
+            return;
+          }
         }
-      };
-    } catch (err) {
-      if (currentSession !== activeSessionId) return;
-      console.error('[Gemini Live] Start error:', sanitizeErrorMessage(err));
-      statusText.textContent = '启动失败: ' + sanitizeErrorMessage(err.message || err);
-      statusText.style.color = '#ef4444';
-      stopSubtitleService(true);
+        // AudioContext 挂起检测（暂停期间也要保持音频上下文可用）
+        if (audioPipelineReady && audioCtx && audioCtx.state === 'suspended') {
+          audioCtx.resume().catch(() => {});
+        }
+        // 音频长时间未发送检测
+        if (audioPipelineReady && !paused && now() - lastAudioSentAt > 5000) {
+          sessionLog('Watchdog: audio pipeline stalled', s, { sinceLastSent: now() - lastAudioSentAt });
+          try { resetResampler(audioCtx ? audioCtx.sampleRate : 48000); } catch (e) {}
+          if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+        }
+      }
+    }, 2500);
+  }
+
+  function forceReconnect(reason) {
+    const old = activeSession;
+    if (old) {
+      closeSession(old, 'force-reconnect:' + reason);
+      activeSession = null;
     }
+    if (!reconnectTimer) scheduleReconnect(reason);
+  }
+
+  // ========================================================================
+  // 8. 服务启停
+  // ========================================================================
+
+  function startSubtitleService(isManualStart = true) {
+    if (isRunning) return;
+    isRunning = true;
+    reconnectAttempts = 0;
+    updateToggleIcon(true);
+    setStatus('info', '🔄 连接中…');
+    startWatchdog();
+    startSilenceFlushTimer();
+    activeSession = null;
+    connectSession(createSession('start'));
+    saveConfig(true);
   }
 
   function stopSubtitleService(isManual = false) {
     isRunning = false;
-    isConnecting = false;
-    activeSessionId++; // Invalidate any in-flight session or reconnect callbacks
+    isConnectingUI = false;
 
-    if (isManual) {
-      isManualDisconnect = true;
-    }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+    if (silenceFlushTimer) { clearInterval(silenceFlushTimer); silenceFlushTimer = null; }
+    if (commitGraceTimer) { clearTimeout(commitGraceTimer); commitGraceTimer = null; }
+    if (spaNavDebounce) { clearTimeout(spaNavDebounce); spaNavDebounce = null; }
+    if (videoWaitTimer) { clearInterval(videoWaitTimer); videoWaitTimer = null; }
 
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    if (standbySession) { closeSession(standbySession, 'service-stop'); standbySession = null; }
+    if (activeSession) { closeSession(activeSession, 'service-stop'); activeSession = null; }
 
-    btnToggle.classList.remove('active');
-    btnToggleIcon.innerHTML = `<polygon points="5 3 19 12 5 21 5 3"></polygon>`;
-    if (isManual && !statusText.textContent.startsWith('❌')) {
-      statusText.textContent = '已暂停';
-      statusText.style.color = '#94a3b8';
-    }
-
-    if (sessionRotationTimer) {
-      clearInterval(sessionRotationTimer);
-      sessionRotationTimer = null;
-    }
-
-    // Call unified audio pipeline & hardware track cleanup
     cleanupAudioPipeline();
-
-    if (ws) {
-      const oldWs = ws;
-      ws = null;
-      oldWs.onopen = null;
-      oldWs.onmessage = null;
-      oldWs.onerror = null;
-      oldWs.onclose = null;
-      try { oldWs.close(); } catch (e) {}
+    commitCurrentLine(true, 'service-stop');
+    updateToggleIcon(false);
+    if (isManual) {
+      setStatus('idle', '已暂停');
+      setDiagnostics({ Session: 0 });
     }
   }
 
-  function restartSession() {
-    stopSubtitleService(true);
-    isManualDisconnect = false;
-    reconnectAttempts = 0;
-    statusText.textContent = '🔄 正在重启并重新连接...';
-    statusText.style.color = '#38bdf8';
-    btnToggle.classList.add('active');
-    btnToggleIcon.innerHTML = `<rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect>`;
-    setTimeout(() => {
-      startSubtitleService(true);
-    }, 150);
-  }
-
-  // Listen for messages from background / popup
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.action === 'PING') {
-      sendResponse({ status: 'PONG' });
-    } else if (msg.action === 'CHECK_OVERLAY_VISIBLE') {
-      const isVisible = overlay && overlay.style.display !== 'none' && overlay.style.display !== '';
-      sendResponse({ status: 'OK', isVisible: isVisible });
-    } else if (msg.action === 'SHOW_OVERLAY') {
-      if (overlay.style.display === 'none' || !overlay.style.display) {
-        overlay.style.display = 'flex';
-        applyInitialStyles();
-        if (!isRunning) startSubtitleService(true);
-      }
-      sendResponse({ status: 'OK', isVisible: true });
-    } else if (msg.action === 'TOGGLE_OVERLAY') {
-      toggleOverlayVisibility();
-      sendResponse({ status: 'OK', isVisible: overlay.style.display !== 'none' });
-    } else if (msg.action === 'UPDATE_CONFIG') {
-      const needsRestart = msg.config && (
-        (msg.config.apiKey !== undefined && msg.config.apiKey !== config.apiKey) ||
-        (msg.config.apiHost !== undefined && msg.config.apiHost !== config.apiHost) ||
-        (msg.config.model !== undefined && msg.config.model !== config.model) ||
-        (msg.config.sourceLang !== undefined && msg.config.sourceLang !== config.sourceLang) ||
-        (msg.config.targetLang !== undefined && msg.config.targetLang !== config.targetLang) ||
-        (msg.config.forcedDomain !== undefined && msg.config.forcedDomain !== config.forcedDomain) ||
-        (msg.config.audioMode !== undefined && msg.config.audioMode !== config.audioMode)
-      );
-
-      config = { ...config, ...msg.config };
+  function toggleOverlayVisibility() {
+    if (overlay.style.display === 'none' || !overlay.style.display) {
+      overlay.style.display = 'flex';
       applyInitialStyles();
-      if (isRunning && needsRestart) {
-        restartSession();
-      }
-      sendResponse({ status: 'OK' });
+      if (!isRunning) startSubtitleService(true);
+    } else {
+      overlay.style.display = 'none';
+      settingsPanel.classList.remove('show');
+      domainMenu.classList.remove('show');
+      if (isRunning) stopSubtitleService(true);
     }
-  });
+  }
+
+  // ========================================================================
+  // 9. 配置加载与消息接口
+  // ========================================================================
+
+  function loadStoredConfig(callback) {
+    try {
+      if (chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get(['geminiLiveConfig'], (res) => {
+          if (res && res.geminiLiveConfig) {
+            config = Object.assign({}, DEFAULT_CONFIG, res.geminiLiveConfig);
+          }
+          if (callback) callback();
+        });
+        return;
+      }
+    } catch (e) {}
+    if (callback) callback();
+  }
+
+  function attachMessageListener() {
+    try {
+      chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+        if (!msg) return;
+        if (msg.action === 'PING') {
+          sendResponse({ status: 'PONG', version: '1.0.5', running: isRunning });
+        } else if (msg.action === 'CHECK_OVERLAY_VISIBLE') {
+          const isVisible = overlay && overlay.style.display !== 'none' && overlay.style.display !== '';
+          sendResponse({ status: 'OK', isVisible: isVisible, running: isRunning });
+        } else if (msg.action === 'SHOW_OVERLAY') {
+          if (overlay.style.display === 'none' || !overlay.style.display) {
+            overlay.style.display = 'flex';
+            applyInitialStyles();
+            if (!isRunning) startSubtitleService(true);
+          }
+          sendResponse({ status: 'OK', isVisible: true });
+        } else if (msg.action === 'TOGGLE_OVERLAY') {
+          toggleOverlayVisibility();
+          sendResponse({ status: 'OK', isVisible: overlay.style.display !== 'none' });
+        } else if (msg.action === 'GET_STATE') {
+          sendResponse({
+            status: 'OK',
+            running: isRunning,
+            sessionId: activeSession ? activeSession.id : 0,
+            state: activeSession ? activeSession.state : 'none',
+            lines: committedLines,
+            audioChunks: audioChunksSent
+          });
+        } else if (msg.action === 'UPDATE_CONFIG') {
+          const previous = config;
+          const incoming = msg.config || {};
+          const needsRestart = isRunning && (
+            (incoming.apiKey !== undefined && incoming.apiKey !== previous.apiKey) ||
+            (incoming.apiHost !== undefined && incoming.apiHost !== previous.apiHost) ||
+            (incoming.model !== undefined && incoming.model !== previous.model) ||
+            (incoming.sourceLang !== undefined && incoming.sourceLang !== previous.sourceLang) ||
+            (incoming.targetLang !== undefined && incoming.targetLang !== previous.targetLang) ||
+            (incoming.audioMode !== undefined && incoming.audioMode !== previous.audioMode) ||
+            (incoming.audioFrameStyle !== undefined && incoming.audioFrameStyle !== previous.audioFrameStyle) ||
+            (incoming.protocolMode !== undefined && incoming.protocolMode !== previous.protocolMode) ||
+            (incoming.responseModality !== undefined && incoming.responseModality !== previous.responseModality)
+          );
+          config = Object.assign({}, config, incoming);
+          applyInitialStyles();
+          updateAudioModeButton();
+          if (needsRestart) manualRestart('配置更新');
+          sendResponse({ status: 'OK' });
+        }
+      });
+    } catch (e) {}
+  }
+
+  // ---- 初始化 ----------------------------------------------------------
+
+  function init() {
+    attachMessageListener();
+    // 多标签页 / popup 修改配置时保持同步（自身写入因值相同会被跳过）
+    try {
+      if (chrome.storage && chrome.storage.onChanged) {
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area !== 'local' || !changes.geminiLiveConfig || !changes.geminiLiveConfig.newValue) return;
+          const incoming = changes.geminiLiveConfig.newValue;
+          if (JSON.stringify(incoming) === JSON.stringify(config)) return;
+          config = Object.assign({}, DEFAULT_CONFIG, incoming);
+          applyInitialStyles();
+          updateAudioModeButton();
+        });
+      }
+    } catch (e) {}
+    updateAudioModeButton();
+    updateEngineBadge();
+    loadStoredConfig(() => {
+      applyInitialStyles();
+      updateAudioModeButton();
+      if (overlay.style.display !== 'none') {
+        // 若此前浮窗已打开，恢复时自动开始
+      }
+      console.log('[Gemini Live] Engine v2 ready. model=', config.model, 'host=', sanitizeUrl(config.apiHost));
+    });
+    // 暴露 DOM 数据给自动化测试与页面内诊断
+    hostEl.dataset.gltVersion = '1.0.5';
+    setDiagnostics({ Session: 0, Lines: 0, AudioChunks: 0 });
+    setStatus('idle', '就绪');
+  }
+
+  init();
 })();
