@@ -114,6 +114,7 @@
   let silenceFlushTimer = null;
   let isUserScrolledUp = false;
   let volumeCheckInterval = null;
+  let connectTimeoutTimer = null;
 
   // Language Detection Heuristic Helper (Zero-Allocation charCodeAt single pass)
   function detectLanguageFromText(text) {
@@ -938,6 +939,7 @@ RULES:
     const initPrompt = overlay.querySelector('#gSubInitialPrompt');
     if (initPrompt) initPrompt.remove();
 
+    console.log('[Gemini Live Translator] Input speech chunk:', chunk);
     currentOrigBuffer += chunk;
     updateActiveStreamingEntry();
     lastAudioTime = Date.now();
@@ -965,6 +967,7 @@ RULES:
     const initPrompt = overlay.querySelector('#gSubInitialPrompt');
     if (initPrompt) initPrompt.remove();
 
+    console.log('[Gemini Live Translator] Translated chunk:', chunk);
     currentTransBuffer += chunk;
     updateActiveStreamingEntry();
     lastAudioTime = Date.now();
@@ -1602,6 +1605,7 @@ RULES:
     const pcmVolumeData = new Uint8Array(analyserNode.frequencyBinCount);
     volumeCheckInterval = setInterval(() => {
       if (!isRunning || !analyserNode) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN || isConnecting) return;
       analyserNode.getByteFrequencyData(pcmVolumeData);
       let sum = 0;
       for (let i = 0; i < pcmVolumeData.length; i++) sum += pcmVolumeData[i];
@@ -1710,6 +1714,11 @@ RULES:
       reconnectTimer = null;
     }
 
+    if (connectTimeoutTimer) {
+      clearTimeout(connectTimeoutTimer);
+      connectTimeoutTimer = null;
+    }
+
     // Teardown any dangling old session
     if (ws || processorNode || analyserNode) {
       stopSubtitleService(false);
@@ -1735,6 +1744,21 @@ RULES:
         return;
       }
 
+      if (connectTimeoutTimer) {
+        clearTimeout(connectTimeoutTimer);
+        connectTimeoutTimer = null;
+      }
+      connectTimeoutTimer = setTimeout(() => {
+        if (currentSession !== activeSessionId) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN || isConnecting) {
+          console.warn('[Gemini Live Translator] Connection / handshake timed out (12s).');
+          statusText.textContent = '⚠️ 连接超时，正在重试...';
+          statusText.style.color = '#f59e0b';
+          try { if (ws) ws.close(); } catch (e) {}
+        }
+      }, 12000);
+
+      console.log('[Gemini Live Translator] Connecting to:', sanitizeUrl(wsUrl));
       let currentWs;
       try {
         currentWs = new WebSocket(wsUrl);
@@ -1753,6 +1777,7 @@ RULES:
           return;
         }
 
+        console.log('[Gemini Live Translator] WebSocket connected! Sending setup payload for:', config.model);
         statusText.textContent = '初始化会话...';
         statusText.style.color = '#34d399';
 
@@ -1830,6 +1855,11 @@ RULES:
 
           // 2. Setup Complete Handshake Acknowledgement
           if (msg.setupComplete !== undefined) {
+            if (connectTimeoutTimer) {
+              clearTimeout(connectTimeoutTimer);
+              connectTimeoutTimer = null;
+            }
+            console.log('[Gemini Live Translator] Handshake complete (setupComplete ACK received).');
             reconnectAttempts = 0; // Handshake successful, reset reconnect backoff count
             try {
               await initAudioCapture(currentSession);
