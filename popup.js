@@ -374,7 +374,8 @@ document.addEventListener('DOMContentLoaded', async () => {
               }
             },
             inputAudioTranscription: {},
-            outputAudioTranscription: {}
+            outputAudioTranscription: {},
+            contextWindowCompression: { slidingWindow: {} }
           }
         };
       } else {
@@ -396,16 +397,25 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     };
 
-    ws.onmessage = (ev) => {
-      const text = typeof ev.data === 'string' ? ev.data : '';
-      if (!text) return;
+    const handleMsgText = (rawText) => {
+      if (!rawText) return;
       let msg;
-      try { msg = JSON.parse(text); } catch (e) { return; }
+      try { msg = JSON.parse(rawText); } catch (e) { return; }
       if (msg.setupComplete !== undefined) {
         const ms = Math.round(performance.now() - t0);
         finish(true, `✅ 握手成功！setupComplete 往返 ${ms} ms（模型 ${model}）`);
       } else if (msg.error) {
         finish(false, '❌ 服务端拒绝: ' + (msg.error.message || JSON.stringify(msg.error)).slice(0, 160));
+      }
+    };
+
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        handleMsgText(ev.data);
+      } else if (ev.data && typeof ev.data.text === 'function') {
+        ev.data.text().then(handleMsgText).catch(() => {});
+      } else if (ev.data instanceof ArrayBuffer) {
+        try { handleMsgText(new TextDecoder().decode(ev.data)); } catch (e) {}
       }
     };
 
