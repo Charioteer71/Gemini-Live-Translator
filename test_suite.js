@@ -856,7 +856,7 @@ test('T5.4: BCP-47 Language Mapping & Native Model Family Detection', () => {
   // 模型族判定：决定 setup 载荷走原生同传还是 Agent 语境模式
   assert.strictEqual(isLiveTranslateModel('models/gemini-3.5-live-translate-preview'), true);
   assert.strictEqual(isLiveTranslateModel('gemini-3.5-live-translate-preview'), true);
-  assert.strictEqual(isLiveTranslateModel('models/gemini-3.1-flash-live-preview'), false);
+  assert.strictEqual(isLiveTranslateModel('models/gemini-pro'), false);
   assert.strictEqual(isLiveTranslateModel(''), false);
   assert.strictEqual(isLiveTranslateModel(null), false);
 });

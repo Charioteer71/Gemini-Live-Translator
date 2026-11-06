@@ -298,7 +298,7 @@
     return {
       id: 'zh',
       name: '简体中文',
-      systemPrompt: '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.\nTARGET LANGUAGE: Strictly Simplified Chinese (简体中文).\nTranslate all incoming speech into natural Simplified Chinese. Never output English or Japanese transcriptions; output only the translated Chinese text.',
+      systemPrompt: '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.\nTARGET LANGUAGE: Strictly Simplified Chinese (简体中文).\nRULES:\n1. Translate all incoming speech into natural Simplified Chinese directly and faithfully, sentence by sentence.\n2. Output ONLY the translated Chinese text. NEVER reply to the speaker, NEVER converse, NEVER ask questions, and NEVER say conversational fillers like "好的".\n3. Even if the speaker asks a question or hesitates, translate their exact words into Chinese, DO NOT answer them.\n4. Never output English or Japanese transcriptions; output only the translated Chinese text.',
       driftWarning: '【语言修正】：目标语言是简体中文，请将音频全部同传为简体中文输出。'
     };
   }
@@ -496,7 +496,6 @@
         <button class="g-sub-domain-btn" id="gSubDomainBtn" title="点击手动切换翻译语境模式">
           <span id="gSubDomainText">🌐 综合通用模式</span> ▾
         </button>
-        <span class="g-sub-engine" id="gSubEngineText">原生同传</span>
       </div>
       <button class="g-sub-scroll-bottom-btn" id="gSubScrollBtn">⬇ 回到最新</button>
 
@@ -524,7 +523,6 @@
   const domainBtn = overlay.querySelector('#gSubDomainBtn');
   const domainText = overlay.querySelector('#gSubDomainText');
   const domainMenu = overlay.querySelector('#gSubDomainMenu');
-  const engineText = overlay.querySelector('#gSubEngineText');
   const scrollBottomBtn = overlay.querySelector('#gSubScrollBtn');
   const srcLangSelect = overlay.querySelector('#gSubSrcLang');
   const tgtLangSelect = overlay.querySelector('#gSubTgtLang');
@@ -568,17 +566,6 @@
     Object.keys(partial || {}).forEach((k) => {
       hostEl.dataset['glt' + k] = String(partial[k]);
     });
-  }
-
-  function updateEngineBadge() {
-    const isTranslate = isLiveTranslateModel(config.model);
-    if (engineText) {
-      engineText.textContent = isTranslate ? '原生同传' : 'Agent 语境';
-      engineText.title = isTranslate
-        ? '原生 Gemini 3.5 Live Translate：连续流式同传，不支持系统提示词'
-        : 'Live Agent 模型：支持系统提示词/语境模式，按语音停顿分段翻译';
-    }
-    hostEl.dataset.gltEngine = isTranslate ? 'translate' : 'agent';
   }
 
   // ---- 音量条 ----------------------------------------------------------
@@ -721,8 +708,7 @@
     const pageCtx = getPageContext();
     domainText.textContent = pageCtx.domainLabel;
     activeDomain = pageCtx.domain;
-    updateEngineBadge();
-    applyDisplayMode();
+        applyDisplayMode();
   }
 
   function applyDisplayMode() {
@@ -852,8 +838,7 @@
   tgtLangSelect.addEventListener('change', () => {
     config.targetLang = tgtLangSelect.value;
     saveConfig(true);
-    updateEngineBadge();
-    if (isRunning) manualRestart('切换目标语言');
+        if (isRunning) manualRestart('切换目标语言');
   });
 
   btnToggle.addEventListener('click', () => {
@@ -889,12 +874,6 @@
       const pageCtx = getPageContext();
       domainText.textContent = pageCtx.domainLabel;
       activeDomain = pageCtx.domain;
-      if (isRunning && !isLiveTranslateModel(config.model)) {
-        manualRestart('切换语境模式');
-      } else if (isRunning) {
-        setStatus('info', '已切换语境（原生同传模型不读取提示词，将在下次重连后生效于 Agent 模型）');
-        setTimeout(() => { if (isRunning) setStatus('ok', '正在同传'); }, 2600);
-      }
     });
   });
 
@@ -1072,7 +1051,7 @@
     if (commitGraceTimer) { clearTimeout(commitGraceTimer); commitGraceTimer = null; }
     lastTranscriptionAt = now();
     lastServerMessageAt = lastTranscriptionAt;
-    currentOrigBuffer += text;
+    currentOrigBuffer = (currentOrigBuffer + text).replace(/([\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff])\s+([\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff])/g, '$1$2');
     renderStreamingLine();
 
     if (String(config.sourceLang || '').includes('自动识别')) {
@@ -1638,41 +1617,21 @@
       };
     }
 
-    if (isLiveTranslateModel(model)) {
-      return {
-        setup: {
-          model,
-          generationConfig: {
-            responseModalities: [config.responseModality === 'TEXT' ? 'TEXT' : 'AUDIO'],
-            translationConfig: {
-              targetLanguageCode: getBcp47LanguageCode(config.targetLang),
-              echoTargetLanguage: true
-            }
-          },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          // contextWindowCompression 实测被服务端接受且无害，保留作为优化；
-          // 但不能稳定消除长会话退化（同配置多连接产出方差 2~118 条/120s，主因疑似网关上上游 Key 质量）。
-          // 真正兜底是上面的看门狗：有语音却长期无转写/译文 → 重连换 Key。
-          contextWindowCompression: { slidingWindow: {} }
-        }
-      };
-    }
-
-    const payload = {
+    return {
       setup: {
         model,
         generationConfig: {
-          responseModalities: ['TEXT'],
-          temperature: 0.3
+          responseModalities: [config.responseModality === 'TEXT' ? 'TEXT' : 'AUDIO'],
+          translationConfig: {
+            targetLanguageCode: getBcp47LanguageCode(config.targetLang),
+            echoTargetLanguage: true
+          }
         },
         inputAudioTranscription: {},
-        outputAudioTranscription: {}
+        outputAudioTranscription: {},
+        contextWindowCompression: { slidingWindow: {} }
       }
     };
-    const prompt = buildDynamicSystemPrompt(getPageContext());
-    if (prompt) payload.setup.systemInstruction = { parts: [{ text: prompt }] };
-    return payload;
   }
 
   function createSession(reason) {
@@ -1745,7 +1704,7 @@
 
     if (!silent) {
       isConnectingUI = true;
-      setStatus('info', `🔗 连接中… (会话 #${session.id})`);
+      setStatus('info', '🔗 正在连接…');
       setDiagnostics({ Session: session.id, Connects: session.id });
     } else {
       sessionLog('Standby session connecting', session);
@@ -1787,7 +1746,7 @@
       }
       try {
         sock.send(JSON.stringify(payload));
-        sessionLog('Setup sent', session, { model: payload.setup.model, engine: isLiveTranslateModel(payload.setup.model) ? 'translate' : 'agent' });
+        sessionLog('Setup sent', session, { model: payload.setup.model });
         if (!silent) setStatus('info', '⚙️ 初始化会话…');
       } catch (e) {
         setStatus('err', '❌ 发送 setup 失败: ' + sanitizeErrorMessage(e));
@@ -1937,7 +1896,12 @@
     }
 
     if (sc.turnComplete || sc.generationComplete) {
-      commitCurrentLine(true, 'turn-complete');
+      // 避免回合结束信号将尚未说完整的句子强行斩断为碎片；若已带句末标点则立即结行，否则延时缓冲
+      if (bufferEndsWithTerminal(currentTransBuffer) || currentTransBuffer.trim().length >= 20) {
+        commitCurrentLine(false, 'turn-complete');
+      } else if (currentTransBuffer.trim()) {
+        scheduleCommit('turn-complete-idle', 600);
+      }
     }
   }
 
@@ -2066,7 +2030,7 @@
     reconnectAttempts = 0;
     isConnectingUI = false;
     updateToggleIcon(true);
-    setStatus('info', '🔄 正在重新连接…');
+    setStatus('info', '🔄 正在连接…');
     setDiagnostics({ Reconnects: 0, Session: 0 });
     startWatchdog();
     startSilenceFlushTimer();
@@ -2213,6 +2177,9 @@
         chrome.storage.local.get(['geminiLiveConfig'], (res) => {
           if (res && res.geminiLiveConfig) {
             config = Object.assign({}, DEFAULT_CONFIG, res.geminiLiveConfig);
+          if (config.model && (/gemini-3\.1/i.test(config.model) || /gemini-2/i.test(config.model))) {
+            config.model = 'models/gemini-3.5-live-translate-preview';
+          }
           }
           if (callback) callback();
         });
@@ -2286,14 +2253,16 @@
           const incoming = changes.geminiLiveConfig.newValue;
           if (JSON.stringify(incoming) === JSON.stringify(config)) return;
           config = Object.assign({}, DEFAULT_CONFIG, incoming);
+          if (config.model && (/gemini-3\.1/i.test(config.model) || /gemini-2/i.test(config.model))) {
+            config.model = 'models/gemini-3.5-live-translate-preview';
+          }
           applyInitialStyles();
           updateAudioModeButton();
         });
       }
     } catch (e) {}
     updateAudioModeButton();
-    updateEngineBadge();
-    loadStoredConfig(() => {
+        loadStoredConfig(() => {
       applyInitialStyles();
       updateAudioModeButton();
       if (overlay.style.display !== 'none') {

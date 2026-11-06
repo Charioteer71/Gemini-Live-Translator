@@ -148,6 +148,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (cfg.apiKey !== undefined) apiKey.value = cfg.apiKey;
 
       if (cfg.model) {
+        if (/gemini-3\.1/i.test(cfg.model) || /gemini-2/i.test(cfg.model)) {
+          cfg.model = 'models/gemini-3.5-live-translate-preview';
+          try { chrome.storage.sync.set({ geminiLiveConfig: cfg }); } catch (e) {}
+        }
         const optionExists = Array.from(modelSelect.options).some(o => o.value === cfg.model);
         if (optionExists) {
           modelSelect.value = cfg.model;
@@ -377,9 +381,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         setup = {
           setup: {
             model: 'models/' + model,
-            generationConfig: { responseModalities: ['TEXT'], temperature: 0.3 },
+            generationConfig: { responseModalities: ['AUDIO'], temperature: 0.3 },
             inputAudioTranscription: {},
             outputAudioTranscription: {},
+            contextWindowCompression: { slidingWindow: {} },
             systemInstruction: { parts: [{ text: 'You are a real-time interpreter. Translate all incoming audio into ' + mapTargetLanguageCode(targetLang.value) + '.' }] }
           }
         };

@@ -380,16 +380,6 @@
   transition: width 0.15s linear, opacity 0.2s ease;
 }
 
-.g-sub-engine {
-  font-size: 9.5px;
-  color: #a78bfa;
-  background: rgba(167, 139, 250, 0.12);
-  border: 1px solid rgba(167, 139, 250, 0.25);
-  border-radius: 4px;
-  padding: 1px 5px;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
 
 /* 字幕显示模式：CSS 层兜底隐藏 */
 #gemini-live-sub-overlay[data-display-mode="trans"] .g-sub-orig {

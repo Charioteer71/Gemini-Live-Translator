@@ -50,11 +50,10 @@
       <label class="form-label">同传模型 (Model)</label>
       <select id="modelSelect" class="form-select">
         <option value="models/gemini-3.5-live-translate-preview" selected>models/gemini-3.5-live-translate-preview (推荐)</option>
-        <option value="models/gemini-3.1-flash-live-preview">models/gemini-3.1-flash-live-preview</option>
         <option value="custom">✏️ 自定义模型名称...</option>
       </select>
       <input type="text" id="customModelInput" class="form-input" style="display: none; margin-top: 6px;" placeholder="例如: models/gemini-xxx">
-      <div class="form-hint" id="modelHint">💡 原生同传模型（live-translate）连续流式翻译、稳定性最佳，但不读取系统提示词；Agent 模型（flash-live）支持语境提示词，按语音停顿分段翻译。</div>
+      <div class="form-hint" id="modelHint">💡 原生同传模型（gemini-3.5-live-translate-preview）：专为低延迟、连续流式双语同传设计。</div>
     </div>
 
     <!-- Connection Self-Test -->
