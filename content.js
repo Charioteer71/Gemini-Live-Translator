@@ -373,12 +373,6 @@
         <span class="g-sub-vol-wrap" id="gSubVolWrap" title="输入音量"><span class="g-sub-vol-fill" id="gSubVolFill"></span></span>
       </div>
       <button class="g-sub-scroll-bottom-btn" id="gSubScrollBtn">⬇ 回到最新</button>
-        <div class="g-sub-domain-item" data-domain="CINEMA">🎬 影视 / 动漫与剧场模式</div>
-        <div class="g-sub-domain-item" data-domain="VTUBER">🎙️ VTuber / 圈内与歌回</div>
-        <div class="g-sub-domain-item" data-domain="TECH_LECTURE">🎓 科技 / 学术演讲模式</div>
-        <div class="g-sub-domain-item" data-domain="GAMING">🎮 游戏实况 / 电竞模式</div>
-        <div class="g-sub-domain-item" data-domain="auto">🤖 自动检测（测试中）</div>
-      </div>
     </div>
   `;
 
