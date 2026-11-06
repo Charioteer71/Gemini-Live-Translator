@@ -1225,7 +1225,7 @@
         scheduleReconnect('audio-send-error');
       }
     }
-    // 握手/重连期间缓存少量音频，避免彻底断档
+    // 握手/重连期间缓存少量音频，保持字幕连续
     if (audioSendQueue.length < AUDIO_MAX_QUEUE_CHUNKS) audioSendQueue.push(payload);
     else {
       audioSendQueue.shift();
