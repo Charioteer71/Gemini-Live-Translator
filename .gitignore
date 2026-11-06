@@ -6,3 +6,4 @@ test_m2.js
 PROJECT.md
 .DS_Store
 node_modules/
+*.zip

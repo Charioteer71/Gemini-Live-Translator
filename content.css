@@ -231,50 +231,6 @@
   color: #fff;
 }
 
-/* Domain Mode Selector Menu */
-.g-sub-domain-menu {
-  display: none;
-  position: absolute;
-  bottom: 34px;
-  left: 80px;
-  width: 230px;
-  background: rgba(15, 23, 42, 0.96);
-  backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  border-radius: 10px;
-  padding: 6px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.7);
-  z-index: 100;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.g-sub-domain-menu.show {
-  display: flex;
-}
-
-.g-sub-domain-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  font-size: 11.5px;
-  color: #cbd5e1;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.g-sub-domain-item:hover {
-  background: rgba(56, 189, 248, 0.15);
-  color: #38bdf8;
-}
-
-.g-sub-domain-item.active {
-  background: rgba(56, 189, 248, 0.22);
-  color: #38bdf8;
-  font-weight: 600;
-}
 
 /* Subtitle Content Area (Scrollable with user-scroll awareness) */
 .g-sub-body {
@@ -391,24 +347,7 @@
 }
 
 
-.g-sub-domain-btn {
-  font-size: 10.5px;
-  color: #38bdf8;
-  background: rgba(56,189,248,0.12);
-  padding: 2px 7px;
-  border-radius: 5px;
-  border: 1px solid rgba(56,189,248,0.28);
-  cursor: pointer;
-  transition: all 0.15s ease;
-  display: flex;
-  align-items: center;
-  gap: 3px;
-}
 
-.g-sub-domain-btn:hover {
-  background: rgba(56,189,248,0.22);
-  border-color: rgba(56,189,248,0.5);
-}
 
 /* Scroll to Bottom Button when user scrolled up */
 .g-sub-scroll-bottom-btn {

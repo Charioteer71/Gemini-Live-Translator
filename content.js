@@ -13,7 +13,7 @@
  *      16kHz/16bit/单声道 → 精确 100ms 分块 → Base64 → realtimeInput
  *   3) 字幕引擎：inputTranscription（原文）+ outputTranscription（译文）
  *      增量合并 → 标点/静音边界断句 → Shadow DOM 零重排渲染
- *   4) 浮窗 UI：拖拽/缩放/透明度/字号/显示模式/音源切换/语境菜单
+ *   4) 浮窗 UI：拖拽/缩放/透明度/字号/显示模式/音源切换
  */
 
 (function () {
@@ -39,7 +39,6 @@
     model: 'models/gemini-3.5-live-translate-preview',
     sourceLang: '自动识别 (Auto Detect)',
     targetLang: '中文普通话 (Chinese)',
-    forcedDomain: 'GENERAL',
     displayMode: 'bilingual', // 'bilingual' | 'trans' | 'orig'
     fontSize: 17,
     opacity: 0.65,
@@ -212,7 +211,6 @@
 
   let isRunning = false;          // 用户是否希望服务运行（意图）
   let detectedSourceLang = 'auto';
-  let activeDomain = 'GENERAL';
 
   // 会话
   let sessionSeq = 0;
@@ -274,131 +272,11 @@
   let isConnectingUI = false;
 
   // ========================================================================
-  // 3. 语言规则与语境提示词（仅 Agent 模型使用）
+  // 3. 静态辅助指令（仅 protocolMode === 'legacy' 回退时使用）
   // ========================================================================
 
-  function getTargetLanguageRule(targetLang) {
-    const t = String(targetLang || '').toLowerCase();
-    if (t.includes('英语') || t.includes('english') || /\ben\b/.test(t)) {
-      return {
-        id: 'en',
-        name: 'English',
-        systemPrompt: '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.\nTARGET LANGUAGE: Strictly English.\nOutput ONLY natural English translations of the incoming speech. Never output Chinese characters or Japanese Kana.',
-        driftWarning: '[Language Drift]: Target language is English. Output all translations in English only!'
-      };
-    }
-    if (t.includes('日语') || t.includes('日語') || t.includes('japanese') || /\bja\b/.test(t)) {
-      return {
-        id: 'ja',
-        name: '日本語',
-        systemPrompt: '[CRITICAL DIRECTIVE]: あなたはリアルタイム同時通訳システムです。\nTARGET LANGUAGE: 日本語。\n入力音声を自然で流暢な日本語に翻訳し、翻訳結果のテキストのみを出力してください。',
-        driftWarning: '【言語修正】：ターゲット言語は日本語です。翻訳結果はすべて日本語で出力してください。'
-      };
-    }
-    return {
-      id: 'zh',
-      name: '简体中文',
-      systemPrompt: '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter.\nTARGET LANGUAGE: Strictly Simplified Chinese (简体中文).\nRULES:\n1. Translate all incoming speech into natural Simplified Chinese directly and faithfully, sentence by sentence.\n2. Output ONLY the translated Chinese text. NEVER reply to the speaker, NEVER converse, NEVER ask questions, and NEVER say conversational fillers like "好的".\n3. Even if the speaker asks a question or hesitates, translate their exact words into Chinese, DO NOT answer them.\n4. Never output English or Japanese transcriptions; output only the translated Chinese text.',
-      driftWarning: '【语言修正】：目标语言是简体中文，请将音频全部同传为简体中文输出。'
-    };
-  }
-
-  function getPageContext() {
-    let title = document.title || '';
-    title = title.replace(/\s*-\s*YouTube$/i, '').replace(/\s*-\s*Twitch$/i, '').replace(/\s*_\s*哔哩哔哩_bilibili$/i, '').trim();
-
-    let channelName = '';
-    const channelEl = document.querySelector('#owner #channel-name a, ytd-channel-name a, #upload-info #channel-name a, [data-a-target="user-channel-link"], .up-name, .username, .up-info--right .name');
-    if (channelEl) channelName = channelEl.textContent.trim();
-
-    let metaTags = '';
-    const tagMeta = document.querySelectorAll('meta[property="og:video:tag"], meta[name="keywords"], meta[property="og:title"]');
-    tagMeta.forEach((m) => { if (m.content) metaTags += ' ' + m.content; });
-
-    const labels = {
-      CINEMA: '🎬 影视 / 动漫与剧场',
-      VTUBER: '🎙️ VTuber / 圈内与歌回',
-      TECH_LECTURE: '🎓 科技 / 学术演讲',
-      GAMING: '🎮 游戏实况 / 电竞',
-      GENERAL: '🌐 综合通用模式'
-    };
-
-    if (config.forcedDomain && config.forcedDomain !== 'auto') {
-      return {
-        title: title.slice(0, 150),
-        channel: channelName.slice(0, 80),
-        domain: config.forcedDomain,
-        domainLabel: labels[config.forcedDomain] || '🏷️ 自定义模式'
-      };
-    }
-
-    const titleLower = title.toLowerCase();
-    const channelLower = channelName.toLowerCase();
-    const metaLower = metaTags.toLowerCase();
-    const fullText = `${titleLower} ${channelLower} ${metaLower}`;
-
-    const scores = { CINEMA: 0, VTUBER: 0, TECH_LECTURE: 0, GAMING: 0 };
-
-    if (/gaming|游戏|单机游戏|网游/.test(metaLower)) scores.GAMING += 30;
-    if (/film & animation|anime|bangumi|番剧|动画|影视|电影/.test(metaLower)) scores.CINEMA += 30;
-    if (/education|science & technology|知识|公开课|科技/.test(metaLower)) scores.TECH_LECTURE += 30;
-    if (/just chatting|virtual youtuber|雑談/.test(metaLower)) scores.VTUBER += 30;
-
-    const formatPatterns = {
-      VTUBER: ['vtuber', 'vstreamer', 'バーチャル', '生配信', '雑談', '歌枠', '歌雑', '凸待ち', '切り抜き', 'virtual youtuber', 'v-tuber', 'sub ch', 'ラジオ', '生放送', '新衣装', 'コラボ', 'collab', '企画', '耐久', '朝活', '夜活', 'ライバー', 'liver'],
-      CINEMA: ['anime', 'animation', 'theatrical', 'ova', 'ona', 'movie', 'film', 'cinema', 'drama', 'series', 'season', 'trailer', 'teaser', 'アニメ', '劇場版', '映画', 'ドラマ', '番剧', '新番', '剧场版', '动画', '声優', '配音', '中字', '字幕', '预告片', '予告', '本編', '正片', '全集', '吹き替え'],
-      TECH_LECTURE: ['keynote', 'symposium', 'colloquium', 'lecture', 'seminar', 'conference', 'presentation', 'tutorial', 'course', 'workshop', 'ted', 'tedx', 'panel discussion', 'roundtable', 'fireside chat', 'interview', 'debate', 'documentary', '公开课', '学术报告', '研讨会', '讲座', '论坛', '教程', '访谈', '学术', '演讲'],
-      GAMING: ['gameplay', 'walkthrough', 'playthrough', 'speedrun', 'esports', "let's play", 'boss fight', '実況', 'ゲーム実況', 'ゲーム配信', 'ゲームプレイ', 'プレイ動画', '初見', '縛りプレイ', 'クリア', '游戏实况', '实况解说', '通关攻略', '对决', '试玩']
-    };
-
-    if (/第\s*\d+\s*[話话集期]|ep\s*\d+|全\s*\d+\s*[話话集]|#\s*\d+/i.test(titleLower)) scores.CINEMA += 25;
-
-    Object.keys(formatPatterns).forEach((domainKey) => {
-      formatPatterns[domainKey].forEach((term) => {
-        if (titleLower.includes(term) || channelLower.includes(term)) scores[domainKey] += 20;
-        else if (metaLower.includes(term)) scores[domainKey] += 10;
-      });
-    });
-
-    let maxDomain = 'GENERAL';
-    let maxScore = 0;
-    Object.keys(scores).forEach((domainKey) => {
-      if (scores[domainKey] > maxScore) {
-        maxScore = scores[domainKey];
-        maxDomain = domainKey;
-      }
-    });
-    if (maxScore < 8) maxDomain = 'GENERAL';
-
-    return {
-      title: title.slice(0, 150),
-      channel: channelName.slice(0, 80),
-      domain: maxDomain,
-      domainLabel: labels[maxDomain]
-    };
-  }
-
-  function buildDynamicSystemPrompt(pageCtx) {
-    const srcLangDesc = String(config.sourceLang || '').includes('自动') ? '自动识别' : config.sourceLang;
-    const tgtRule = getTargetLanguageRule(config.targetLang);
-    let domainModule = '';
-    switch (pageCtx.domain) {
-      case 'CINEMA':
-        domainModule = '【场景：影视/动漫】地道生动的影视译制风格，多角色对白清晰独立，忽略环境拟音与背景音乐。';
-        break;
-      case 'VTUBER':
-        domainModule = '【场景：VTuber/直播】口语自然亲切，准确传达主播语气、情绪与观众互动氛围。';
-        break;
-      case 'TECH_LECTURE':
-        domainModule = '【场景：科技/学术演讲】严谨准确、逻辑清晰，完整保留复合长句与专业术语。';
-        break;
-      case 'GAMING':
-        domainModule = '【场景：游戏实况/电竞】节奏明快，准确翻译操作术语、战术沟通与临场反应。';
-        break;
-      default:
-        domainModule = '【场景：通用】流畅通顺、通俗自然，准确传达原意与语气。';
-    }
-    return `${tgtRule.systemPrompt}\n\n【视频参考背景】\n- 标题：${pageCtx.title || '无'}\n- 频道：${pageCtx.channel || '无'}\n- 源语言：${srcLangDesc}\n- 目标语言：${tgtRule.name}\n${domainModule}`;
+  function buildDynamicSystemPrompt() {
+    return '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter. Output ONLY natural translations of the incoming speech in the target language.';
   }
 
   // ========================================================================
@@ -493,14 +371,8 @@
         <span class="g-sub-conn-dot" id="gSubConnDot"></span>
         <span id="gSubStatusText">就绪</span>
         <span class="g-sub-vol-wrap" id="gSubVolWrap" title="输入音量"><span class="g-sub-vol-fill" id="gSubVolFill"></span></span>
-        <button class="g-sub-domain-btn" id="gSubDomainBtn" title="点击手动切换翻译语境模式">
-          <span id="gSubDomainText">🌐 综合通用模式</span> ▾
-        </button>
       </div>
       <button class="g-sub-scroll-bottom-btn" id="gSubScrollBtn">⬇ 回到最新</button>
-
-      <div class="g-sub-domain-menu" id="gSubDomainMenu">
-        <div class="g-sub-domain-item active" data-domain="GENERAL">🌐 综合通用模式 (默认)</div>
         <div class="g-sub-domain-item" data-domain="CINEMA">🎬 影视 / 动漫与剧场模式</div>
         <div class="g-sub-domain-item" data-domain="VTUBER">🎙️ VTuber / 圈内与歌回</div>
         <div class="g-sub-domain-item" data-domain="TECH_LECTURE">🎓 科技 / 学术演讲模式</div>
@@ -520,9 +392,6 @@
   const statusText = overlay.querySelector('#gSubStatusText');
   const connDot = overlay.querySelector('#gSubConnDot');
   const volFill = overlay.querySelector('#gSubVolFill');
-  const domainBtn = overlay.querySelector('#gSubDomainBtn');
-  const domainText = overlay.querySelector('#gSubDomainText');
-  const domainMenu = overlay.querySelector('#gSubDomainMenu');
   const scrollBottomBtn = overlay.querySelector('#gSubScrollBtn');
   const srcLangSelect = overlay.querySelector('#gSubSrcLang');
   const tgtLangSelect = overlay.querySelector('#gSubTgtLang');
@@ -699,15 +568,6 @@
     blurVal.textContent = `${config.blur}px`;
     fontSizeSlider.value = config.fontSize;
     fontSizeVal.textContent = `${config.fontSize}px`;
-
-    const activeForced = config.forcedDomain || 'GENERAL';
-    domainMenu.querySelectorAll('.g-sub-domain-item').forEach((item) => {
-      item.classList.toggle('active', item.getAttribute('data-domain') === activeForced);
-    });
-
-    const pageCtx = getPageContext();
-    domainText.textContent = pageCtx.domainLabel;
-    activeDomain = pageCtx.domain;
         applyDisplayMode();
   }
 
@@ -849,7 +709,6 @@
   btnClose.addEventListener('click', () => {
     overlay.style.display = 'none';
     settingsPanel.classList.remove('show');
-    domainMenu.classList.remove('show');
     if (isRunning) stopSubtitleService(true);
   });
 
@@ -858,30 +717,10 @@
     settingsPanel.classList.toggle('show');
   });
 
-  domainBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    domainMenu.classList.toggle('show');
-  });
-
-  domainMenu.querySelectorAll('.g-sub-domain-item').forEach((item) => {
-    item.addEventListener('click', (e) => {
-      e.stopPropagation();
-      config.forcedDomain = item.getAttribute('data-domain');
-      saveConfig(true);
-      domainMenu.querySelectorAll('.g-sub-domain-item').forEach((i) => i.classList.remove('active'));
-      item.classList.add('active');
-      domainMenu.classList.remove('show');
-      const pageCtx = getPageContext();
-      domainText.textContent = pageCtx.domainLabel;
-      activeDomain = pageCtx.domain;
-    });
-  });
-
   document.addEventListener('click', (e) => {
     const path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
     if (!path.includes(settingsPanel) && !path.includes(btnSettings)) settingsPanel.classList.remove('show');
-    if (!path.includes(domainMenu) && !path.includes(domainBtn)) domainMenu.classList.remove('show');
-  });
+      });
 
   opacitySlider.addEventListener('input', () => {
     config.opacity = parseInt(opacitySlider.value, 10) / 100;
@@ -1222,9 +1061,6 @@
       if (!isRunning) return;
       const newVideo = findActiveVideo();
       if (newVideo && newVideo !== currentBoundVideo) rebindActiveVideo(newVideo);
-      const pageCtx = getPageContext();
-      domainText.textContent = pageCtx.domainLabel;
-      activeDomain = pageCtx.domain;
     }, 400);
   }
 
@@ -1601,7 +1437,7 @@
 
     if (useLegacy) {
       // 兼容模式：真机 E2E 验证可连续同传的载荷（v1.0.4 形态 + 语境/目标语言系统提示词）
-      const legacyPrompt = `${buildDynamicSystemPrompt(getPageContext())}\n\n[MODE]: Real-time simultaneous interpretation of the incoming audio. Output ONLY the translated text in the target language, continuously, without waiting for turns.`;
+      const legacyPrompt = `${buildDynamicSystemPrompt()}\n\n[MODE]: Real-time simultaneous interpretation of the incoming audio. Output ONLY the translated text in the target language, continuously, without waiting for turns.`;
       return {
         setup: {
           model,
@@ -2162,7 +1998,6 @@
     } else {
       overlay.style.display = 'none';
       settingsPanel.classList.remove('show');
-      domainMenu.classList.remove('show');
       if (isRunning) stopSubtitleService(true);
     }
   }

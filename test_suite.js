@@ -585,7 +585,7 @@ test('T3.7: Default Config Consistency & Audio Frame Format Builders', () => {
 
   // README 版本一致性
   const readme = fs.readFileSync(path.join(ROOT_DIR, 'README.md'), 'utf8');
-  assert(readme.includes('v1.0.5'), 'README must document current version v1.0.5');
+  assert(readme.includes('v1.0.6'), 'README must document current version v1.0.6');
   assert(readme.includes('mediaChunks'), 'README must document mediaChunks audio frame requirement');
 });
 
