@@ -151,7 +151,7 @@ test('T1.2: Manifest V3 Specification & Metadata Schema', () => {
   const manifest = JSON.parse(manifestCode);
   assert.strictEqual(manifest.manifest_version, 3, 'Manifest version must be 3');
   assert.strictEqual(manifest.name, 'Gemini Live Translator (实时双语同传字幕)', 'Name must match extension branding');
-  assert(manifest.version, 'Manifest must declare version');
+  assert.strictEqual(manifest.version, '1.1.0', 'Manifest version must be 1.1.0');
   assert(manifest.description, 'Manifest must declare description');
   assert(manifest.icons && manifest.icons['16'] && manifest.icons['48'] && manifest.icons['128'], 'Icons (16, 48, 128) must be declared');
   assert.strictEqual(manifest.background.service_worker, 'background.js', 'Background service worker must be background.js');
@@ -181,7 +181,9 @@ test('T1.4: Web Accessible Resources & Content Script Declarations', () => {
   const cs = manifest.content_scripts[0];
   assert(cs.matches.includes('<all_urls>'), 'Content script must match <all_urls>');
   assert(cs.js.includes('content.js'), 'Content script must load content.js');
-  assert(cs.css.includes('content.css'), 'Content script must load content.css');
+  if (Array.isArray(cs.css) && cs.css.length > 0) {
+    assert(cs.css.includes('content.css'), 'Content script must load content.css');
+  }
   assert.strictEqual(cs.run_at, 'document_idle', 'Content script run_at must be document_idle');
 });
 
@@ -199,71 +201,127 @@ test('T1.5: Background Service Worker Architecture & Message Routing', () => {
 // ============================================================================
 startTier('TIER 2', 'Web Audio & Resampling Pipeline (Linear Interpolation, Zero-GC, Base64)');
 
-// Reusable downsampler simulator matching content.js algorithm
-function resampleLinear(inputData, nativeRate, targetRate, outputPcm16) {
-  const sampleRatio = nativeRate / targetRate;
-  const outLength = Math.floor(inputData.length / sampleRatio);
-  for (let i = 0; i < outLength; i++) {
-    const srcPos = i * sampleRatio;
-    const idx0 = Math.floor(srcPos);
-    const idx1 = idx0 + 1 < inputData.length ? idx0 + 1 : inputData.length - 1;
-    const frac = srcPos - idx0;
-    const s0 = Number.isFinite(inputData[idx0]) ? inputData[idx0] : 0;
-    const s1 = Number.isFinite(inputData[idx1]) ? inputData[idx1] : 0;
-    const sample = (1 - frac) * s0 + frac * s1;
-    const clamped = Math.max(-1, Math.min(1, sample));
-    outputPcm16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
-  }
-  return outLength;
+// Extract real resampler state and functions from content.js
+function createContentResamplerHarness() {
+  const resamplerBlockMatch = contentCode.match(/const resampler = \{[\s\S]*?\n  \};/);
+  const resetResamplerMatch = contentCode.match(/function resetResampler\([\s\S]*?\n  \}/);
+  const sampleAtMatch = contentCode.match(/function resamplerSampleAt\([\s\S]*?\n  \}/);
+  const resampleBlockMatch = contentCode.match(/function resampleBlock\([\s\S]*?\n  \}/);
+  assert(
+    resamplerBlockMatch && resetResamplerMatch && sampleAtMatch && resampleBlockMatch,
+    'Resampler state and functions must be extractable from content.js'
+  );
+
+  return new Function(`
+    const AUDIO_CHUNK_SAMPLES = 1600;
+    const flushedChunks = [];
+    ${resamplerBlockMatch[0]}
+    function consumePendingAudio() {
+      if (resampler.pendingCount > 0) {
+        flushedChunks.push(resampler.pending.slice(0, resampler.pendingCount));
+        resampler.pendingCount = 0;
+      }
+    }
+    ${resetResamplerMatch[0]}
+    ${sampleAtMatch[0]}
+    ${resampleBlockMatch[0]}
+    return { resampler, flushedChunks, resetResampler, resamplerSampleAt, resampleBlock };
+  `)();
 }
 
 test('T2.1: High-Fidelity Linear Interpolation Resampling (48kHz -> 16kHz & 44.1kHz -> 16kHz)', () => {
-  const pcm16 = new Int16Array(4096);
+  const harness = createContentResamplerHarness();
 
   // 1. DC 1.0 Signal -> Should be 32767
+  harness.resetResampler(48000);
   const dcOne = new Float32Array(4096).fill(1.0);
-  const outLen1 = resampleLinear(dcOne, 48000, 16000, pcm16);
+  const outLen1 = harness.resampleBlock(dcOne);
   assert.strictEqual(outLen1, Math.floor(4096 / 3));
   for (let i = 0; i < outLen1; i++) {
-    assert.strictEqual(pcm16[i], 32767, `Expected 32767 at index ${i}`);
+    assert.strictEqual(harness.resampler.pending[i], 32767, `Expected 32767 at index ${i}`);
   }
 
   // 2. DC -1.0 Signal -> Should be -32768
+  harness.resetResampler(48000);
   const dcNegOne = new Float32Array(4096).fill(-1.0);
-  const outLen2 = resampleLinear(dcNegOne, 48000, 16000, pcm16);
+  const outLen2 = harness.resampleBlock(dcNegOne);
+  assert.strictEqual(outLen2, Math.floor(4096 / 3));
   for (let i = 0; i < outLen2; i++) {
-    assert.strictEqual(pcm16[i], -32768, `Expected -32768 at index ${i}`);
+    assert.strictEqual(harness.resampler.pending[i], -32768, `Expected -32768 at index ${i}`);
   }
 
   // 3. DC 0.0 Signal -> Should be 0
+  harness.resetResampler(44100);
   const dcZero = new Float32Array(4096).fill(0.0);
-  const outLen3 = resampleLinear(dcZero, 44100, 16000, pcm16);
+  const outLen3 = harness.resampleBlock(dcZero);
+  assert(outLen3 > 1400, `Expected >1400 samples for 44.1kHz -> 16kHz, got ${outLen3}`);
   for (let i = 0; i < outLen3; i++) {
-    assert.strictEqual(pcm16[i], 0, `Expected 0 at index ${i}`);
+    assert.strictEqual(harness.resampler.pending[i], 0, `Expected 0 at index ${i}`);
   }
 
   // 4. Fractional Interpolation Accuracy: Ramp from 0.0 to 1.0
+  harness.resetResampler(48000);
   const ramp = new Float32Array(4096);
   for (let i = 0; i < ramp.length; i++) ramp[i] = i / ramp.length;
-  const outLen4 = resampleLinear(ramp, 48000, 16000, pcm16);
+  const outLen4 = harness.resampleBlock(ramp);
   for (let i = 1; i < outLen4; i++) {
-    assert(pcm16[i] >= pcm16[i - 1], `Resampled ramp must be monotonic at index ${i}`);
+    assert(harness.resampler.pending[i] >= harness.resampler.pending[i - 1], `Resampled ramp must be monotonic at index ${i}`);
   }
 });
 
 test('T2.2: Resampler Overflow Clamping & NaN / Infinity Safety Guards', () => {
-  const pcm16 = new Int16Array(4096);
+  const harness = createContentResamplerHarness();
+
+  // Case A: 1:1 step (16kHz -> 16kHz) so every sample is tested directly without skipping
+  harness.resetResampler(16000);
   const dirtyBuffer = new Float32Array([
-    1.5, 2.0, 999.0,         // Positive overshoots
-    -1.5, -2.0, -999.0,      // Negative overshoots
-    NaN, Infinity, -Infinity,// Malformed floats
-    0.5, -0.5
+    1.5, 2.0, 999.0,          // Positive overshoots -> must clamp to 32767 (NOT wrap!)
+    -1.5, -2.0, -999.0,       // Negative overshoots -> must clamp to -32768 (NOT wrap!)
+    NaN, Infinity, -Infinity, // Malformed floats -> must sanitize to 0
+    0.5, -0.5, 0              // Normal values (12th sample serves as lookahead boundary)
   ]);
 
-  const outLen = resampleLinear(dirtyBuffer, 48000, 16000, pcm16);
-  for (let i = 0; i < outLen; i++) {
-    assert(Number.isFinite(pcm16[i]), `Output sample at ${i} must be finite integer`);
-    assert(pcm16[i] >= -32768 && pcm16[i] <= 32767, `Output sample at ${i} out of 16-bit range`);
+  const outLenA = harness.resampleBlock(dirtyBuffer);
+  assert.strictEqual(outLenA, 11, `Expected 11 resampled outputs, got ${outLenA}`);
+  assert.strictEqual(harness.resampler.pending[0], 32767, '1.5 must clamp to 32767');
+  assert.strictEqual(harness.resampler.pending[1], 32767, '2.0 must clamp to 32767');
+  assert.strictEqual(harness.resampler.pending[2], 32767, '999.0 must clamp to 32767');
+  assert.strictEqual(harness.resampler.pending[3], -32768, '-1.5 must clamp to -32768');
+  assert.strictEqual(harness.resampler.pending[4], -32768, '-2.0 must clamp to -32768');
+  assert.strictEqual(harness.resampler.pending[5], -32768, '-999.0 must clamp to -32768');
+  assert.strictEqual(harness.resampler.pending[6], 0, 'NaN must sanitize to 0');
+  assert.strictEqual(harness.resampler.pending[7], 0, 'Infinity must sanitize to 0');
+  assert.strictEqual(harness.resampler.pending[8], 0, '-Infinity must sanitize to 0');
+  assert.strictEqual(harness.resampler.pending[9], 16383, '0.5 must convert to 16383');
+  assert.strictEqual(harness.resampler.pending[10], -16384, '-0.5 must convert to -16384');
+
+  // Case B: Fractional interpolation with NaN/Infinity neighbors (24kHz -> 16kHz, step=1.5)
+  harness.resetResampler(24000);
+  const fracDirty = new Float32Array([0.5, NaN, 0.5, Infinity, -0.5, -Infinity, 0.5]);
+  const outLenB = harness.resampleBlock(fracDirty);
+  assert(outLenB >= 4, `Expected >=4 fractional outputs, got ${outLenB}`);
+  assert.strictEqual(harness.resampler.pending[0], 16383, 'p=0 -> 0.5 => 16383');
+  assert.strictEqual(harness.resampler.pending[1], 8191, 'p=1.5 (s0=NaN->0, s1=0.5, frac=0.5) => 8191');
+  assert.strictEqual(harness.resampler.pending[2], 0, 'p=3.0 (s0=Infinity->0) => 0');
+  assert.strictEqual(harness.resampler.pending[3], -8192, 'p=4.5 (s0=-0.5, s1=-Infinity->0, frac=0.5) => -8192');
+
+  // Case C: Cross-block streaming phase & carry continuity (48kHz -> 16kHz)
+  harness.resetResampler(48000);
+  const block1 = new Float32Array(1024);
+  const block2 = new Float32Array(1024);
+  for (let i = 0; i < 1024; i++) {
+    block1[i] = i / 2048;
+    block2[i] = (1024 + i) / 2048;
+  }
+  const c1 = harness.resampleBlock(block1);
+  const c2 = harness.resampleBlock(block2);
+  assert(c1 > 0 && c2 > 0, 'Both streaming blocks must produce samples');
+  const totalOut = harness.resampler.pendingCount;
+  for (let i = 1; i < totalOut; i++) {
+    assert(
+      harness.resampler.pending[i] >= harness.resampler.pending[i - 1],
+      `Cross-block ramp must stay monotonic across boundary at ${i}`
+    );
   }
 });
 
@@ -340,13 +398,14 @@ test('T2.5: Microphone Hardware Stream Track Immediate Teardown', () => {
   for (let i = 0; i < FRAME_SIZE; i++) {
     inputBuffer[i] = Math.sin((i / FRAME_SIZE) * Math.PI * 2 * 440);
   }
-  const outputPcm16 = new Int16Array(FRAME_SIZE);
+  const benchHarness = createContentResamplerHarness();
+  benchHarness.resetResampler(48000);
 
   const t0 = performance.now();
   let totalResampledSamples = 0;
   for (let f = 0; f < FRAMES; f++) {
-    const outLen = resampleLinear(inputBuffer, 48000, 16000, outputPcm16);
-    totalResampledSamples += outLen;
+    totalResampledSamples += benchHarness.resampleBlock(inputBuffer);
+    benchHarness.resampler.pendingCount = 0;
   }
   const elapsedMs = performance.now() - t0;
   const totalInputSamples = FRAMES * FRAME_SIZE;
@@ -354,9 +413,9 @@ test('T2.5: Microphone Hardware Stream Track Immediate Teardown', () => {
   const throughputMBps = (((totalInputSamples * 4) / (1024 * 1024)) / (elapsedMs / 1000)).toFixed(2);
 
   benchmarkResults.push({
-    name: 'Audio Resampler (48k->16k Linear Interpolation)',
+    name: 'Audio Resampler (content.js resampleBlock 48k->16k)',
     metric: `${megaSamplesPerSec} MSamples/s (${throughputMBps} MB/s input)`,
-    duration: `${elapsedMs.toFixed(2)} ms for ${FRAMES.toLocaleString()} frames`
+    duration: `${elapsedMs.toFixed(2)} ms for ${FRAMES.toLocaleString()} frames (${totalResampledSamples.toLocaleString()} out)`
   });
 })();
 
@@ -583,10 +642,53 @@ test('T3.7: Default Config Consistency & Audio Frame Format Builders', () => {
   const audioFrame = buildFrame({ audioFrameStyle: 'audio' }, 'QUJD');
   assert(audioFrame.includes('"audio"') && !audioFrame.includes('mediaChunks'), 'audio frame mode must use realtimeInput.audio field');
 
-  // README 版本一致性
+  // 全文件版本一致性校验
+  const manifestObj = JSON.parse(manifestCode);
+  const popupHtml = fs.readFileSync(path.join(ROOT_DIR, 'popup.html'), 'utf8');
   const readme = fs.readFileSync(path.join(ROOT_DIR, 'README.md'), 'utf8');
-  assert(readme.includes('v1.0.6'), 'README must document current version v1.0.6');
+  assert.strictEqual(
+    manifestObj.version,
+    '1.1.0',
+    `manifest.json version must be 1.1.0, got ${manifestObj.version}`
+  );
+  assert(popupHtml.includes(`Release v${manifestObj.version}`), 'popup.html versionBadge must match manifest.json version');
+  assert(readme.includes(`当前版本：**v${manifestObj.version}**`), 'README current version must match manifest.json version');
+  assert(contentCode.includes(`'${manifestObj.version}'`), 'content.js fallback version must match manifest.json version');
+  assert(bgCode.includes(`'${manifestObj.version}'`), 'background.js fallback version must match manifest.json version');
   assert(readme.includes('mediaChunks'), 'README must document mediaChunks audio frame requirement');
+});
+
+test('T3.8: Protobuf goAway Duration Parsing, Standby Isolation & Fast Server-Error Failover', () => {
+  const parseDurationSeconds = extractFunctionFromCode(contentCode, 'parseDurationSeconds');
+  assert.strictEqual(parseDurationSeconds('59s'), 59, 'Must parse Protobuf string "59s"');
+  assert.strictEqual(parseDurationSeconds('30.5s'), 30.5, 'Must parse fractional Protobuf string "30.5s"');
+  assert.strictEqual(parseDurationSeconds(45), 45, 'Must parse numeric seconds');
+  assert.strictEqual(parseDurationSeconds('-5s'), 0, 'Negative durations must clamp to 0');
+  assert.strictEqual(parseDurationSeconds(null), 0, 'Null duration must return 0 without NaN');
+  assert.strictEqual(parseDurationSeconds(undefined), 0, 'Undefined duration must return 0 without NaN');
+
+  // Verify standby failures do not hijack UI status or reconnect active session
+  assert(contentCode.includes("scheduleRotation(activeSession, 'standby-timeout-retry'"), 'Standby timeout must schedule retry without clobbering active status');
+  assert(contentCode.includes("closeSession(session, 'transient-server-error')"), 'Non-terminal server error must immediately close poisoned socket and reconnect');
+  assert(contentCode.includes("sock.binaryType = 'arraybuffer'"), 'WebSocket must use synchronous arraybuffer binaryType for strict frame ordering');
+  assert(contentCode.includes('firstOrigSinceOutAt'), 'Watchdog must track firstOrigSinceOutAt to catch sessions that never emit initial translation');
+});
+
+test('T3.9: Host Validation, Zero-Width Credential Stripping & Restricted Tab Safety', () => {
+  const cleanInputString = extractFunctionFromCode(contentCode, 'cleanInputString');
+  const isValidApiHostMatch = contentCode.match(/function isValidApiHost\(hostRaw\)\s*\{([\s\S]*?)\n  \}/);
+  assert(isValidApiHostMatch, 'isValidApiHost must be defined in content.js');
+  const isValidApiHost = new Function('cleanInputString', `return (function(hostRaw){${isValidApiHostMatch[1]}});`)(cleanInputString);
+
+  assert.strictEqual(isValidApiHost('https://'), false, 'Bare https:// must be rejected as invalid host');
+  assert.strictEqual(isValidApiHost('wss://'), false, 'Bare wss:// must be rejected as invalid host');
+  assert.strictEqual(isValidApiHost('   \u200B  '), false, 'Whitespace / zero-width string must be rejected');
+  assert.strictEqual(isValidApiHost('https://gateway.example.com/v1beta/models/'), true, 'Valid custom gateway URL must pass');
+  assert.strictEqual(cleanInputString('  \u200BAIzaSyTest123\uFEFF\n '), 'AIzaSyTest123', 'Zero-width chars and whitespace must be stripped from credentials');
+
+  assert(!popupJsCode.includes('chrome.storage.sync'), 'popup.js must use chrome.storage.local consistently (no stray storage.sync)');
+  assert(popupJsCode.includes('isInjectableTabUrl'), 'popup.js must guard script injection against restricted browser URLs');
+  assert(popupJsCode.includes('chrome.tabs.getCurrent'), 'popup.js must detect standalone options tab via chrome.tabs.getCurrent');
 });
 
 // ============================================================================
@@ -707,7 +809,7 @@ test('T4.3: Zero-Reflow Streaming Subtitle Mutation via Persistent Text Nodes', 
 test('T4.4: rAF Scroll Batching & Anti-Scroll-Jacking Protection', () => {
   const scrollMatch = contentCode.match(/function safeScrollToBottom\(\)\s*\{([\s\S]*?)\n  \}/);
   assert(scrollMatch, 'safeScrollToBottom must be defined');
-  assert(scrollMatch[1].includes('requestAnimationFrame'), 'safeScrollToBottom must use requestAnimationFrame');
+  assert(scrollMatch[1].includes('scrollRafId = requestAnimationFrame('), 'safeScrollToBottom must batch scroll via scrollRafId = requestAnimationFrame(...)');
   assert(scrollMatch[1].includes('isScrollPending'), 'safeScrollToBottom must check isScrollPending flag');
   
   assert(contentCode.includes('cancelPendingScroll'), 'content.js must define cancelPendingScroll');
@@ -733,7 +835,7 @@ test('T4.5: CSS Custom Properties on Root & Zero DOM Querying in Sliders', () =>
 
 test('T4.6: 250ms Debounced Storage Persistence & Immediate Flush Mode', () => {
   assert(contentCode.includes('saveConfigTimer = setTimeout('), 'saveConfig must debounce via setTimeout');
-  assert(contentCode.includes('250'), 'saveConfig debounce interval must be 250ms');
+  assert(/saveConfigTimer\s*=\s*setTimeout\([^,]+,\s*250\s*\)/.test(contentCode), 'saveConfig debounce interval must be 250ms');
   assert(contentCode.includes('if (immediate)'), 'saveConfig must support immediate synchronous flush mode');
   assert(popupJsCode.includes('notifyActiveTabDebounced'), 'popup.js must debounce slider changes to tab');
   assert(popupJsCode.includes('250'), 'popup.js debounce interval must be 250ms');
@@ -745,6 +847,77 @@ test('T4.7: Event Retargeting & Fullscreen Reparenting Mechanics', () => {
   assert(contentCode.includes('overlay.getBoundingClientRect()'), 'drag listener must compute offsets via getBoundingClientRect()');
   assert(contentCode.includes('fsElement.appendChild(hostEl)'), 'handleFullscreenChange must reparent hostEl to document.fullscreenElement');
   assert(contentCode.includes('document.body.appendChild(hostEl)'), 'handleFullscreenChange must restore hostEl to document.body on exit');
+});
+
+test('T4.8: Lookahead CJK Spacing Normalization, Echo Dedup & Layout Anti-Jitter CSS', () => {
+  const cjkReMatch = contentCode.match(/const CJK_INNER_SPACE_RE = (\/.+\/g);/);
+  assert(cjkReMatch, 'CJK_INNER_SPACE_RE must be defined');
+  const cjkRe = eval(cjkReMatch[1]);
+
+  const spacedJa = 'お、 キーボード。 女子 さんの キーボード。 満足 度 高い です。';
+  assert.strictEqual(
+    spacedJa.replace(cjkRe, '$1'),
+    'お、キーボード。女子さんのキーボード。満足度高いです。',
+    'Consecutive and post-punctuation CJK spaces must collapse in a single pass'
+  );
+
+  const mixedEnJa = '今日その新曲 FR 2 のね';
+  assert.strictEqual(
+    mixedEnJa.replace(cjkRe, '$1'),
+    '今日その新曲 FR 2 のね',
+    'Spaces around embedded Latin/alphanumeric tokens must be preserved'
+  );
+
+  // Echo deduplication across punctuation differences
+  const normMatch = contentCode.match(/function normalizeForEchoCompare\(s\)\s*\{([\s\S]*?)\n  \}/);
+  const echoMatch = contentCode.match(/function isEchoDuplicate\(orig, trans\)\s*\{([\s\S]*?)\n  \}/);
+  assert(normMatch && echoMatch, 'Echo deduplication helpers must exist');
+  const isEchoDuplicate = new Function(`
+    function normalizeForEchoCompare(s) { ${normMatch[1]} }
+    return function isEchoDuplicate(orig, trans) { ${echoMatch[1]} };
+  `)();
+  assert.strictEqual(isEchoDuplicate('今天天气不错', '今天天气不错。'), true, 'Same-language echo differing only by punctuation must be detected');
+  assert.strictEqual(isEchoDuplicate('すごい。', '太棒了。'), false, 'Distinct bilingual pair must not be marked echo');
+
+  // CSS layout stability guards
+  assert(cssCode.includes('flex-wrap: wrap'), '.g-sub-header must wrap gracefully on narrow widths');
+  assert(cssCode.includes('text-overflow: ellipsis'), '#gSubStatusText must use ellipsis to prevent 2-line height jumps');
+  assert(contentCode.includes('ResizeObserver'), 'content.js must persist dimensions via ResizeObserver');
+});
+
+test('T4.9: Non-Destructive Audio Tap Teardown, captureStream Fallback & Unified Config Sync', () => {
+  assert(contentCode.includes('disconnectTapNodesFromSource'), 'content.js must selectively disconnect tap nodes without severing video destination passthrough');
+  assert(contentCode.includes('audioSourceNode.disconnect(analyserNode)'), 'Must disconnect analyserNode specifically on video-element source');
+  assert(contentCode.includes('audioSourceNode.disconnect(processorNode)'), 'Must disconnect processorNode specifically on video-element source');
+  assert(contentCode.includes('video.captureStream'), 'getOrCreateAudioGraph must fall back to video.captureStream when element is already bound');
+  assert(contentCode.includes('gemini-live-translator-teardown'), 'content.js must dispatch and handle cross-instance teardown event');
+  assert(contentCode.includes('function applyConfigUpdate('), 'content.js must unify storage.onChanged and UPDATE_CONFIG handling');
+  assert(contentCode.includes('lastLocalPersistJson'), 'content.js must suppress self-triggered storage echo snap-back');
+});
+
+test('T4.10: Pure Vector SVG Icon System & Zero Emoji UI Regression', () => {
+  const popupHtmlCode = fs.readFileSync(path.join(ROOT_DIR, 'popup.html'), 'utf8');
+  const popupCssCode = fs.readFileSync(path.join(ROOT_DIR, 'popup.css'), 'utf8');
+  const emojiOrDingbatRe = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2300}-\u{23FF}\u{FE0F}]/u;
+
+  assert(!emojiOrDingbatRe.test(contentCode), 'content.js must contain zero emojis or dingbat symbols');
+  assert(!emojiOrDingbatRe.test(popupHtmlCode), 'popup.html must contain zero emojis or dingbat symbols');
+  assert(!emojiOrDingbatRe.test(popupJsCode), 'popup.js must contain zero emojis or dingbat symbols');
+  assert(!emojiOrDingbatRe.test(cssCode), 'content.css must contain zero emojis or dingbat symbols');
+  assert(!emojiOrDingbatRe.test(popupCssCode), 'popup.css must contain zero emojis or dingbat symbols');
+  assert(!emojiOrDingbatRe.test(bgCode), 'background.js must contain zero emojis or dingbat symbols');
+
+  assert(contentCode.includes('const UI_ICONS = {'), 'content.js must define vector UI_ICONS registry');
+  assert(contentCode.includes('id="gSubStatusIcon"'), 'content.js must render vector status icon container');
+  assert(popupJsCode.includes('const POPUP_SVGS = {'), 'popup.js must define vector POPUP_SVGS registry');
+  assert(popupHtmlCode.includes('<svg class="ui-icon"'), 'popup.html must use inline vector SVG icons');
+  assert(fs.existsSync(path.join(ROOT_DIR, 'icons', 'icon48.png')), 'Extension PNG logo icons/icon48.png must remain untouched');
+
+  // Custom Glassmorphic Dropdown System assertions
+  assert(cssCode.includes('.g-sub-dropdown') && cssCode.includes('.g-sub-select-menu'), 'content.css must style custom .g-sub-dropdown and .g-sub-select-menu');
+  assert(popupCssCode.includes('.ui-dropdown') && popupCssCode.includes('.ui-select-menu'), 'popup.css must style custom .ui-dropdown and .ui-select-menu');
+  assert(contentCode.includes('function enhanceCustomSelect('), 'content.js must define enhanceCustomSelect');
+  assert(popupJsCode.includes('function enhancePopupSelect('), 'popup.js must define enhancePopupSelect');
 });
 
 // ============================================================================
@@ -767,6 +940,12 @@ test('T5.1: Zero Plaintext API Key Leakage Across All Traces', () => {
   const sanitizedErr = sanitizeErrorMessage(errorObj);
   assert(!sanitizedErr.includes(secretKey), 'sanitizeErrorMessage must strip key from Error object message');
   assert(sanitizedErr.includes('***REDACTED***'), 'sanitizeErrorMessage must insert ***REDACTED***');
+
+  // Standalone Google API Key Redaction (even without ?key= query prefix)
+  const bareKeyErr = new Error(`Upstream rejected header x-goog-api-key: ${secretKey} in request`);
+  const sanitizedBare = sanitizeErrorMessage(bareKeyErr);
+  assert(!sanitizedBare.includes(secretKey), 'sanitizeErrorMessage must strip bare AIza* API keys');
+  assert(sanitizedBare.includes('***REDACTED***'), 'sanitizeErrorMessage must replace bare key with ***REDACTED***');
 
   // Edge cases: null, undefined, numbers
   assert.strictEqual(sanitizeErrorMessage(null), '');
@@ -866,6 +1045,7 @@ test('T5.5: Fast detectLanguageFromText Heuristic Classification Accuracy', () =
   assert.strictEqual(detectLanguageFromText('\uC548\uB155\uD558\uC138\uC694 \uC5EC\uB7EC\uBD84'), 'ko', 'Korean detection');
   assert.strictEqual(detectLanguageFromText('Welcome to the live simultaneous translation stream.'), 'en', 'English detection');
   assert.strictEqual(detectLanguageFromText('欢迎来到人工智能与自然语言处理大会'), 'zh', 'Chinese detection');
+  assert.strictEqual(detectLanguageFromText('㐀㐁㐂㐃㐄㐅㐆㐇'), 'zh', 'CJK Extension A detection');
   assert.strictEqual(detectLanguageFromText(''), 'auto', 'Empty input returns auto');
   assert.strictEqual(detectLanguageFromText(null), 'auto', 'Null input returns auto');
 });

@@ -3,6 +3,8 @@
 test_challenger*.js
 test_e2e*.js
 test_m2.js
+test_unit_m*.js
+test_tier5*.js
 PROJECT.md
 .DS_Store
 node_modules/

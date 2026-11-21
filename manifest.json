@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Gemini Live Translator (实时双语同传字幕)",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "基于 Google Gemini 官方 Live Translate 实时音频流 API 的浏览器双语同传字幕扩展，提供低延迟、高稳定的连续流式同传体验。",
   "permissions": [
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "tabCapture",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -33,7 +35,8 @@
     {
       "resources": [
         "icons/*",
-        "content.css"
+        "content.css",
+        "audio_worklet.js"
       ],
       "matches": [
         "<all_urls>"
@@ -45,13 +48,26 @@
       "matches": [
         "<all_urls>"
       ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
       "js": [
         "content.js"
       ],
-      "css": [
-        "content.css"
-      ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
+      "js": [
+        "spa_hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ]
 }
