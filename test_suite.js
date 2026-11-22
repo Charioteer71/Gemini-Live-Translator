@@ -92,6 +92,7 @@ function extractFunctionFromCode(code, funcName) {
 const ROOT_DIR = __dirname;
 const manifestFile = path.join(ROOT_DIR, 'manifest.json');
 const bgFile = path.join(ROOT_DIR, 'background.js');
+const glossaryDbFile = path.join(ROOT_DIR, 'glossary_db.js');
 const contentFile = path.join(ROOT_DIR, 'content.js');
 const cssFile = path.join(ROOT_DIR, 'content.css');
 const popupJsFile = path.join(ROOT_DIR, 'popup.js');
@@ -99,6 +100,7 @@ const popupHtmlFile = path.join(ROOT_DIR, 'popup.html');
 
 const manifestCode = fs.readFileSync(manifestFile, 'utf8');
 const bgCode = fs.readFileSync(bgFile, 'utf8');
+const glossaryDbCode = fs.readFileSync(glossaryDbFile, 'utf8');
 const contentCode = fs.readFileSync(contentFile, 'utf8');
 const cssCode = fs.readFileSync(cssFile, 'utf8');
 const popupJsCode = fs.readFileSync(popupJsFile, 'utf8');
@@ -137,6 +139,7 @@ startTier('TIER 1', 'Syntax & Manifest V3 Schema Integrity');
 test('T1.1: JavaScript Syntax Evaluation Across All Files', () => {
   const jsFiles = [
     { name: 'background.js', code: bgCode },
+    { name: 'glossary_db.js', code: glossaryDbCode },
     { name: 'content.js', code: contentCode },
     { name: 'popup.js', code: popupJsCode }
   ];
@@ -151,7 +154,8 @@ test('T1.2: Manifest V3 Specification & Metadata Schema', () => {
   const manifest = JSON.parse(manifestCode);
   assert.strictEqual(manifest.manifest_version, 3, 'Manifest version must be 3');
   assert.strictEqual(manifest.name, 'Gemini Live Translator (实时双语同传字幕)', 'Name must match extension branding');
-  assert.strictEqual(manifest.version, '1.1.0', 'Manifest version must be 1.1.0');
+  assert.strictEqual(manifest.version, '1.3.0', 'Manifest version must be 1.3.0');
+  assert(Array.isArray(manifest.content_scripts[0].js) && manifest.content_scripts[0].js[0] === 'glossary_db.js' && manifest.content_scripts[0].js[1] === 'content.js', 'content_scripts[0].js must load glossary_db.js before content.js');
   assert(manifest.description, 'Manifest must declare description');
   assert(manifest.icons && manifest.icons['16'] && manifest.icons['48'] && manifest.icons['128'], 'Icons (16, 48, 128) must be declared');
   assert.strictEqual(manifest.background.service_worker, 'background.js', 'Background service worker must be background.js');
@@ -648,13 +652,14 @@ test('T3.7: Default Config Consistency & Audio Frame Format Builders', () => {
   const readme = fs.readFileSync(path.join(ROOT_DIR, 'README.md'), 'utf8');
   assert.strictEqual(
     manifestObj.version,
-    '1.1.0',
-    `manifest.json version must be 1.1.0, got ${manifestObj.version}`
+    '1.3.0',
+    `manifest.json version must be 1.3.0, got ${manifestObj.version}`
   );
   assert(popupHtml.includes(`Release v${manifestObj.version}`), 'popup.html versionBadge must match manifest.json version');
   assert(readme.includes(`当前版本：**v${manifestObj.version}**`), 'README current version must match manifest.json version');
   assert(contentCode.includes(`'${manifestObj.version}'`), 'content.js fallback version must match manifest.json version');
   assert(bgCode.includes(`'${manifestObj.version}'`), 'background.js fallback version must match manifest.json version');
+  assert(glossaryDbCode.includes(`"version": "${manifestObj.version}"`), 'glossary_db.js version must match manifest.json version');
   assert(readme.includes('mediaChunks'), 'README must document mediaChunks audio frame requirement');
 });
 
@@ -1048,6 +1053,140 @@ test('T5.5: Fast detectLanguageFromText Heuristic Classification Accuracy', () =
   assert.strictEqual(detectLanguageFromText('㐀㐁㐂㐃㐄㐅㐆㐇'), 'zh', 'CJK Extension A detection');
   assert.strictEqual(detectLanguageFromText(''), 'auto', 'Empty input returns auto');
   assert.strictEqual(detectLanguageFromText(null), 'auto', 'Null input returns auto');
+});
+
+test('T5.6: v1.3.0 Standard vs Enhanced Mode Protocol, Shared Glossary DB (6 Macros / 60 Sub-Clusters / Top-100), Keyword/Stem Matching & Custom Glossary', () => {
+  const glossaryDb = require(glossaryDbFile);
+  assert.strictEqual(glossaryDb.version, '1.3.0', 'glossary_db.js version must be 1.3.0');
+  assert.strictEqual(glossaryDb.macros.length, 6, 'Must define all 6 UI macro-categories');
+  assert.strictEqual(glossaryDb.subClusters.length, 60, 'Must define all 60 fine-grained sub-clusters');
+  assert.deepStrictEqual(
+    glossaryDb.macros.map((m) => m.id),
+    ['ai_tech', 'vtuber_acgn', 'media_podcast_culture', 'gaming_esports_sim', 'history_politics_econ', 'science_medicine_academia']
+  );
+  assert(glossaryDb.stats.totalEntries >= 6000, 'Compiled glossary DB must include >6000 verified entries');
+  assert(contentCode.includes('GEMINI_LIVE_GLOSSARY_DB'), 'content.js must bind shared GEMINI_LIVE_GLOSSARY_DB');
+  assert(popupJsCode.includes('GEMINI_LIVE_GLOSSARY_DB'), 'popup.js must bind shared GEMINI_LIVE_GLOSSARY_DB');
+  assert(popupHtmlCode.includes('<script src="glossary_db.js"></script>'), 'popup.html must load glossary_db.js');
+
+  // Legacy v1.2.0 pack ID migration
+  assert.deepStrictEqual(
+    glossaryDb.normalizePresetPackIds(['jp_stream_music', 'gaming_sim', 'academic_finance', 'ai_tech', 'unknown_id']),
+    ['vtuber_acgn', 'gaming_esports_sim', 'history_politics_econ', 'ai_tech']
+  );
+
+  // Strict keyword boundary matching
+  assert.strictEqual(glossaryDb.doesKeywordMatchContext('AI', 'Daily Vlog Routine'), false, 'Short ASCII keyword AI must not false-match Daily');
+  assert.strictEqual(glossaryDb.doesKeywordMatchContext('AI', 'Summer Movie Trailer'), false, 'Short ASCII keyword AI must not false-match Trailer');
+  assert.strictEqual(glossaryDb.doesKeywordMatchContext('AI', 'Please Wait Here'), false, 'Short ASCII keyword AI must not false-match Wait');
+  assert.strictEqual(glossaryDb.doesKeywordMatchContext('AI', 'Google AI Agent Keynote 2026'), true, 'AI must match standalone token');
+  assert.strictEqual(glossaryDb.doesKeywordMatchContext('AI', '[AI大模型] 架构分享'), true, 'AI must match mixed ASCII+CJK boundary');
+  assert.strictEqual(glossaryDb.doesKeywordMatchContext('歌枠', '【歌枠】花譜 記念配信'), true, 'Japanese keyword must match title');
+
+  // USSR / Marxist Project deep description + stem matching + Top-100 cap
+  const ussrSel = glossaryDb.selectDynamicGlossary({
+    pageCtx: {
+      channel: 'The Marxist Project',
+      title: 'The Fall of the USSR: The Economy and Other Problems, ft. 1Dime',
+      tags: [],
+      description: 'What was the logic of the Soviet economy, and where did it falter? We discuss this and other problems of the late Soviet era...'
+    },
+    manualPackIds: [],
+    autoPresetGlossary: true,
+    customEntries: []
+  });
+  assert(ussrSel.autoMatchedMacroIds.includes('history_politics_econ'), 'USSR video must match history_politics_econ');
+  assert(ussrSel.matchedSubClusters.some((s) => s.id === 'soviet_cold_war_history'), 'USSR video must match soviet_cold_war_history');
+  assert(ussrSel.matchedSubClusters.some((s) => s.id === 'marxism_critical_political_economy'), 'USSR video must match marxism_critical_political_economy');
+  assert(ussrSel.selectedPresetEntries.length > 0 && ussrSel.selectedPresetEntries.length <= 100, 'Dynamic selection must stay within Top-100 cap');
+  const ussrSrcs = new Set(ussrSel.selectedPresetEntries.map((e) => e.source));
+  assert(ussrSrcs.has('Gosplan') && ussrSrcs.has('Perestroika') && ussrSrcs.has('Command economy') && ussrSrcs.has('Soft budget constraint') && ussrSrcs.has('Surplus value'));
+
+  const parsedCustom = glossaryDb.parseGlossaryEntries('# comment\n  Model Context Protocol ＝ 自定义协议  \n// note\nCloud Run\nModel Context Protocol = 重复项忽略\n\n');
+  assert.strictEqual(parsedCustom.length, 2, 'Comments, blank lines, and case-insensitive duplicates must be filtered');
+  assert.deepStrictEqual(parsedCustom[0], { type: 'pair', source: 'Model Context Protocol', target: '自定义协议', raw: 'Model Context Protocol = 自定义协议' });
+  assert.deepStrictEqual(parsedCustom[1], { type: 'noun', source: 'Cloud Run', raw: 'Cloud Run' });
+
+  // Verify buildSetupPayload for Standard vs Enhanced & sourceLang languageCodes
+  const setupMatch = contentCode.match(/function buildSetupPayload\(\)\s*\{([\s\S]*?)\n  \}/);
+  assert(setupMatch, 'buildSetupPayload must be extractable');
+  const makeSetup = (cfg, enhancedBuilder) => new Function(
+    'config', 'normalizeModelName', 'isLiveTranslateModel', 'getBcp47LanguageCode', 'buildDynamicSystemPrompt', 'buildNativeEnhancedSystemInstruction',
+    'return (' + setupMatch[0] + ')();'
+  )(
+    cfg,
+    (m) => 'models/' + String(m || '').replace(/^models\//i, ''),
+    (m) => /live-translate/i.test(String(m || '')),
+    (lang) => getBcp47LanguageCode(lang),
+    () => 'LEGACY',
+    enhancedBuilder
+  );
+
+  // 1) Standard mode sends NO systemInstruction even if packs/customGlossary exist in config
+  const stdPayload = makeSetup({
+    model: 'models/gemini-3.5-live-translate-preview',
+    sourceLang: '日语 (Japanese)',
+    targetLang: '中文普通话 (Chinese)',
+    translationMode: 'standard',
+    enabledPresetPacks: ['ai_tech'],
+    customGlossary: 'Foo = Bar',
+    responseModality: 'AUDIO',
+    protocolMode: 'native'
+  }, () => 'SHOULD_NOT_BE_CALLED');
+  assert.strictEqual(stdPayload.setup.systemInstruction, undefined, 'Standard mode must omit systemInstruction');
+  assert.deepStrictEqual(stdPayload.setup.inputAudioTranscription, { languageCodes: ['ja-JP'] }, 'Explicit Japanese sourceLang must pass ja-JP languageCodes');
+  assert.strictEqual(stdPayload.setup.generationConfig.translationConfig.sourceLanguageCode, undefined);
+
+  // 2) Enhanced mode injects setup.systemInstruction alongside translationConfig
+  const enhPayload = makeSetup({
+    model: 'models/gemini-3.5-live-translate-preview',
+    sourceLang: '英语 (English)',
+    targetLang: '中文普通话 (Chinese)',
+    translationMode: 'enhanced',
+    responseModality: 'AUDIO',
+    protocolMode: 'native'
+  }, () => 'ENHANCED_TRANSLATION_GUIDE');
+  assert.deepStrictEqual(enhPayload.setup.systemInstruction, { parts: [{ text: 'ENHANCED_TRANSLATION_GUIDE' }] });
+  assert.deepStrictEqual(enhPayload.setup.inputAudioTranscription, { languageCodes: ['en-US'] });
+  assert.strictEqual(enhPayload.setup.generationConfig.translationConfig.targetLanguageCode, 'zh-Hans');
+
+  // 3) Auto Detect keeps inputAudioTranscription as {}
+  const autoPayload = makeSetup({
+    model: 'models/gemini-3.5-live-translate-preview',
+    sourceLang: '自动识别 (Auto Detect)',
+    targetLang: '中文普通话 (Chinese)',
+    translationMode: 'standard',
+    responseModality: 'AUDIO',
+    protocolMode: 'native'
+  }, () => '');
+  assert.deepStrictEqual(autoPayload.setup.inputAudioTranscription, {});
+});
+
+test('T5.7: Scroll-to-Bottom Anti-Deadlock Guards & Clean Status Bar Invariants', () => {
+  assert(cssCode.includes('overflow-anchor: none'), 'content.css .g-sub-body must disable browser scroll anchoring');
+  assert(contentCode.includes('maxPinnedScrollTop'), 'content.js must track maxPinnedScrollTop to prevent false scroll-up locks on height growth');
+  assert(contentCode.includes('markProgrammaticScroll'), 'content.js must guard programmatic scroll transitions across rendering frames');
+
+  // Status bar must remain clean (zero mode buttons inside .g-sub-status-bar)
+  const statusBarMatch = contentCode.match(/<div class="g-sub-status-bar">([\s\S]*?)<\/div>\s*`;/);
+  assert(statusBarMatch, 'g-sub-status-bar markup must exist in content.js');
+  assert(!statusBarMatch[1].includes('gSubMode'), 'Bottom status bar must not contain mode switcher buttons');
+});
+
+test('T5.8: Zero Banned Words Across Code, Comments, UI, Tests & Docs', () => {
+  const bannedWordRe = new RegExp('\u5f7b\u5e95|\u964d\u7ef4|\u5347\u7ef4');
+  const candidates = [
+    'manifest.json', 'background.js', 'glossary_db.js', 'content.js', 'content.css',
+    'popup.html', 'popup.css', 'popup.js', 'README.md',
+    'spa_hook.js', 'offscreen.html', 'offscreen.js', 'audio_worklet.js', 'test_suite.js'
+  ];
+  for (const rel of candidates) {
+    const p = path.join(ROOT_DIR, rel);
+    if (fs.existsSync(p)) {
+      const txt = fs.readFileSync(p, 'utf8');
+      assert(!bannedWordRe.test(txt), `Banned word detected in ${rel}`);
+    }
+  }
 });
 
 // Benchmark: Language Detection & Sanitization Ops/Sec

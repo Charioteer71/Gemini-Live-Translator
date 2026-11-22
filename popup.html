@@ -12,7 +12,7 @@
       <img src="icons/icon48.png" style="width: 24px; height: 24px; border-radius: 6px;" alt="Logo" />
       <h1 class="brand-title">Gemini Live Translator</h1>
     </div>
-    <div class="brand-badge" id="versionBadge">Release v1.1.0</div>
+    <div class="brand-badge" id="versionBadge">Release v1.3.0</div>
   </header>
 
   <main class="popup-content">
@@ -110,6 +110,115 @@
       </div>
     </div>
 
+    <!-- Translation Mode & Context / Glossary Enhancement -->
+    <div class="form-group">
+      <div class="label-row">
+        <span class="form-label">同传模式 (Translation Mode)</span>
+        <span class="mode-status-badge" id="modeStatusBadge">纯净基线</span>
+      </div>
+      <div class="preset-group" role="group" aria-label="同传模式选择">
+        <button type="button" class="preset-btn active" id="btnModeStandard" aria-pressed="true">
+          <svg class="ui-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M8 12h8"></path></svg>
+          <span>标准模式</span>
+        </button>
+        <button type="button" class="preset-btn" id="btnModeEnhanced" aria-pressed="false">
+          <svg class="ui-icon" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"></path><path d="M19 16l.9 2.1L22 19l-2.1.9L19 22l-.9-2.1L16 19l2.1-.9L19 16z"></path></svg>
+          <span>语境与术语增强</span>
+        </button>
+      </div>
+      <div class="form-hint" id="translationModeHint">不注入特定网页语境与术语表，使用原生纯净同传基线。</div>
+    </div>
+
+    <div class="enhanced-panel" id="enhancedConfigPanel">
+      <div class="toggle-chip-row">
+        <button type="button" class="toggle-chip active" id="btnAutoPageContext" aria-pressed="true">
+          <svg class="ui-icon-xs" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+          <span>自动网页语境</span>
+        </button>
+        <button type="button" class="toggle-chip" id="btnAutoPresetGlossary" aria-pressed="false">
+          <svg class="ui-icon-xs" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+          <span>关键词自动词库</span>
+        </button>
+      </div>
+
+      <div class="context-preview-box" id="popupContextPreview">网页语境：在视频页面开启增强模式后自动提取标题、频道与简介并动态匹配细分词库</div>
+
+      <div class="form-group">
+        <div class="label-row">
+          <span class="form-label">内置预设词库包（按需勾选，动态精选 Top-100）</span>
+          <span class="form-hint" id="presetActiveSummary">已选 0 个包</span>
+        </div>
+        <div class="preset-packs-grid" id="presetPacksGrid">
+          <button type="button" class="preset-pack-card" id="packCard_ai_tech" data-pack="ai_tech" title="AI、软件与前沿科技（1250词条/12子领域）：涵盖前沿大模型、Agent 协议、云原生架构、半导体硬件与网络安全术语" aria-pressed="false">
+            <div class="pack-card-top">
+              <span class="pack-card-title">AI 与前沿科技</span>
+              <svg class="ui-icon-xs pack-check-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+            </div>
+            <span class="pack-card-meta">1250 词条</span>
+          </button>
+          <button type="button" class="preset-pack-card" id="packCard_vtuber_acgn" data-pack="vtuber_acgn" title="虚拟主播与日系ACGN（1176词条/12子领域）：涵盖主流虚拟主播企划、神椿虚拟歌手、日语歌回杂谈、Vocaloid 与 2026 新番动画漫画术语" aria-pressed="false">
+            <div class="pack-card-top">
+              <span class="pack-card-title">虚拟主播与ACGN</span>
+              <svg class="ui-icon-xs pack-check-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+            </div>
+            <span class="pack-card-meta">1176 词条</span>
+          </button>
+          <button type="button" class="preset-pack-card" id="packCard_media_podcast_culture" data-pack="media_podcast_culture" title="影视播客与互联网文化（543词条/6子领域）：涵盖影视制片与影评、英语视频论文与深度播客、创作者经济及英日互联网流行文化表达" aria-pressed="false">
+            <div class="pack-card-top">
+              <span class="pack-card-title">影视播客与文化</span>
+              <svg class="ui-icon-xs pack-check-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+            </div>
+            <span class="pack-card-meta">543 词条</span>
+          </button>
+          <button type="button" class="preset-pack-card" id="packCard_gaming_esports_sim" data-pack="gaming_esports_sim" title="游戏电竞与硬核模拟（1219词条/12子领域）：涵盖3A与独立新作、二游机制、FPS/MOBA/格斗电竞解说及战争雷霆/DCS等军武防务模拟术语" aria-pressed="false">
+            <div class="pack-card-top">
+              <span class="pack-card-title">游戏电竞与军武</span>
+              <svg class="ui-icon-xs pack-check-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+            </div>
+            <span class="pack-card-meta">1219 词条</span>
+          </button>
+          <button type="button" class="preset-pack-card" id="packCard_history_politics_econ" data-pack="history_politics_econ" title="历史政治、社科哲学与财经（1522词条/12子领域）：涵盖苏联与冷战史、世界史、马克思主义政治经济学、国际关系、社科理论与宏观金融财报术语" aria-pressed="false">
+            <div class="pack-card-top">
+              <span class="pack-card-title">历史政经与社科</span>
+              <svg class="ui-icon-xs pack-check-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+            </div>
+            <span class="pack-card-meta">1522 词条</span>
+          </button>
+          <button type="button" class="preset-pack-card" id="packCard_science_medicine_academia" data-pack="science_medicine_academia" title="自然科学、医学与公开课（558词条/6子领域）：涵盖天文航天、量子物理与能源、分子生物基因工程、循证临床医学、神经科学与数学高校公开课术语" aria-pressed="false">
+            <div class="pack-card-top">
+              <span class="pack-card-title">自然科学与公开课</span>
+              <svg class="ui-icon-xs pack-check-icon" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></svg>
+            </div>
+            <span class="pack-card-meta">558 词条</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <div class="label-row">
+          <label class="form-label" for="customGlossaryInput">自定义术语表</label>
+          <span class="form-hint" id="customGlossaryCount">0 条有效词条</span>
+        </div>
+        <textarea id="customGlossaryInput" class="form-textarea" rows="3" spellcheck="false" placeholder="每行一条：原词 = 指定译法，或单独填写保留专有名词"></textarea>
+        <div class="glossary-actions-row">
+          <button type="button" class="glossary-btn" id="btnImportGlossary">
+            <svg class="ui-icon-xs" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+            <span>导入词库</span>
+          </button>
+          <button type="button" class="glossary-btn" id="btnExportTxt">
+            <svg class="ui-icon-xs" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            <span>导出 TXT</span>
+          </button>
+          <button type="button" class="glossary-btn" id="btnExportJson">
+            <svg class="ui-icon-xs" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            <span>导出 JSON</span>
+          </button>
+        </div>
+        <input type="file" id="glossaryFileInput" accept=".txt,.json,application/json,text/plain" style="display: none;" aria-label="选择词库文件">
+        <div class="form-hint" id="glossaryActionHint" aria-live="polite"></div>
+      </div>
+    </div>
+
     <!-- UI Sliders -->
     <div class="form-group">
       <div class="label-row">
@@ -150,6 +259,7 @@
       图标，可直接在视频画面上实时调整透明度、字号与显示模式。</span>
   </footer>
 
+  <script src="glossary_db.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

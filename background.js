@@ -23,8 +23,52 @@ const DEFAULT_CONFIG = {
 };
 
 const EXTENSION_VERSION = (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getManifest === 'function')
-  ? (chrome.runtime.getManifest().version || '1.1.0')
-  : '1.1.0';
+  ? (chrome.runtime.getManifest().version || '1.3.0')
+  : '1.3.0';
+
+const VALID_PRESET_PACK_IDS = [
+  'ai_tech',
+  'vtuber_acgn',
+  'media_podcast_culture',
+  'gaming_esports_sim',
+  'history_politics_econ',
+  'science_medicine_academia'
+];
+
+const LEGACY_PRESET_PACK_MAP = {
+  ai_tech: 'ai_tech',
+  jp_stream_music: 'vtuber_acgn',
+  gaming_sim: 'gaming_esports_sim',
+  academic_finance: 'history_politics_econ'
+};
+
+function sanitizeCustomGlossaryText(val) {
+  let raw = '';
+  if (typeof val === 'string') {
+    raw = val;
+  } else if (Array.isArray(val)) {
+    raw = val.filter((x) => typeof x === 'string' || typeof x === 'number').join('\n');
+  } else {
+    return '';
+  }
+  const cleaned = raw
+    .replace(/[\u200B-\u200D\uFEFF\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+    .replace(/\r\n?/g, '\n');
+  const lines = cleaned.split('\n');
+  const out = [];
+  let nonEmptyCount = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\s+$/g, '').slice(0, 260);
+    if (line.trim()) {
+      nonEmptyCount++;
+      if (nonEmptyCount > 500) break;
+    } else if (out.length > 0 && out[out.length - 1] === '') {
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n').trim().slice(0, 32768);
+}
 
 function cleanCredentialInput(val) {
   return String(val || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
@@ -129,6 +173,38 @@ function migrateConfig(stored) {
         top: merged.pos.top
       };
     }
+  }
+  if (merged.translationMode !== undefined) {
+    merged.translationMode = merged.translationMode === 'enhanced' ? 'enhanced' : 'standard';
+  }
+  if (merged.autoPageContext !== undefined) {
+    merged.autoPageContext = typeof merged.autoPageContext === 'boolean' ? merged.autoPageContext : true;
+  }
+  if (merged.autoPresetGlossary !== undefined) {
+    merged.autoPresetGlossary = typeof merged.autoPresetGlossary === 'boolean' ? merged.autoPresetGlossary : false;
+  }
+  if (merged.enabledPresetPacks !== undefined) {
+    if (!Array.isArray(merged.enabledPresetPacks)) {
+      merged.enabledPresetPacks = [];
+    } else {
+      const seenPacks = new Set();
+      const validPacks = [];
+      for (let i = 0; i < merged.enabledPresetPacks.length; i++) {
+        const rawPid = merged.enabledPresetPacks[i];
+        if (typeof rawPid !== 'string') continue;
+        const pid = VALID_PRESET_PACK_IDS.indexOf(rawPid) !== -1
+          ? rawPid
+          : (LEGACY_PRESET_PACK_MAP[rawPid] || '');
+        if (pid && VALID_PRESET_PACK_IDS.indexOf(pid) !== -1 && !seenPacks.has(pid)) {
+          seenPacks.add(pid);
+          validPacks.push(pid);
+        }
+      }
+      merged.enabledPresetPacks = validPacks;
+    }
+  }
+  if (merged.customGlossary !== undefined) {
+    merged.customGlossary = sanitizeCustomGlossaryText(merged.customGlossary);
   }
   merged.schemaVersion = DEFAULT_CONFIG.schemaVersion;
   return merged;
@@ -600,9 +676,9 @@ async function ensureContentScriptInjected(tabId) {
       } catch (e2) {}
     }
     try {
-      await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content.js'] });
+      await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['glossary_db.js', 'content.js'] });
     } catch (allErr) {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['glossary_db.js', 'content.js'] });
     }
     await new Promise((r) => setTimeout(r, 120));
     return await pingTopFrame(tabId);

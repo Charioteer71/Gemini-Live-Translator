@@ -2,6 +2,280 @@ document.addEventListener('DOMContentLoaded', async () => {
   const OFFICIAL_HOST = 'https://generativelanguage.googleapis.com';
   const DEFAULT_MODEL = 'models/gemini-3.5-live-translate-preview';
 
+  const GLOSSARY_DB = (typeof globalThis !== 'undefined' && globalThis.GEMINI_LIVE_GLOSSARY_DB)
+    ? globalThis.GEMINI_LIVE_GLOSSARY_DB
+    : ((typeof window !== 'undefined' && window.GEMINI_LIVE_GLOSSARY_DB) ? window.GEMINI_LIVE_GLOSSARY_DB : null);
+
+  const MAX_PRESET_GLOSSARY_INJECT = (GLOSSARY_DB && typeof GLOSSARY_DB.maxPresetGlossaryInject === 'number')
+    ? GLOSSARY_DB.maxPresetGlossaryInject
+    : 100;
+
+  const MAX_SYSTEM_CONTEXT_CHARS = 260;
+
+  const LEGACY_PRESET_PACK_MAP = (GLOSSARY_DB && GLOSSARY_DB.legacyPackMigrationMap) || {
+    ai_tech: 'ai_tech',
+    jp_stream_music: 'vtuber_acgn',
+    gaming_sim: 'gaming_esports_sim',
+    academic_finance: 'history_politics_econ'
+  };
+
+  const BUILT_IN_GLOSSARY_PACKS = (GLOSSARY_DB && Array.isArray(GLOSSARY_DB.macros))
+    ? GLOSSARY_DB.macros
+    : [
+      { id: 'ai_tech', shortName: 'AI 与前沿科技', name: 'AI、软件与前沿科技', description: '', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'vtuber_acgn', shortName: '虚拟主播与ACGN', name: '虚拟主播与日系ACGN', description: '', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'media_podcast_culture', shortName: '影视播客与文化', name: '影视播客与互联网文化', description: '', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'gaming_esports_sim', shortName: '游戏电竞与军武', name: '游戏电竞与硬核模拟', description: '', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'history_politics_econ', shortName: '历史政经与社科', name: '历史政治、社科哲学与财经', description: '', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'science_medicine_academia', shortName: '自然科学与公开课', name: '自然科学、医学与公开课', description: '', registerHint: '', subClusterCount: 0, entryCount: 0 }
+    ];
+
+  function normalizePresetPackIds(rawIds) {
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.normalizePresetPackIds === 'function') {
+      return GLOSSARY_DB.normalizePresetPackIds(rawIds);
+    }
+    if (!Array.isArray(rawIds)) return [];
+    const seen = new Set();
+    const out = [];
+    for (let i = 0; i < rawIds.length; i++) {
+      const raw = rawIds[i];
+      if (typeof raw !== 'string') continue;
+      const mapped = BUILT_IN_GLOSSARY_PACKS.some((p) => p.id === raw)
+        ? raw
+        : (LEGACY_PRESET_PACK_MAP[raw] || '');
+      if (mapped && !seen.has(mapped) && BUILT_IN_GLOSSARY_PACKS.some((p) => p.id === mapped)) {
+        seen.add(mapped);
+        out.push(mapped);
+      }
+    }
+    return out;
+  }
+
+  function parseGlossaryEntries(rawInput) {
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.parseGlossaryEntries === 'function') {
+      return GLOSSARY_DB.parseGlossaryEntries(rawInput, 500);
+    }
+    let lines = [];
+    if (Array.isArray(rawInput)) {
+      lines = rawInput.map((x) => (x === null || x === undefined ? '' : String(x)));
+    } else if (typeof rawInput === 'string') {
+      lines = rawInput.replace(/\r\n?/g, '\n').split('\n');
+    } else {
+      return [];
+    }
+    const entries = [];
+    const seenKeys = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      if (entries.length >= 500) break;
+      const cleaned = lines[i]
+        .replace(/[\u200B-\u200D\uFEFF\x00-\x1F\x7F]/g, '')
+        .trim();
+      if (!cleaned || cleaned.startsWith('#') || cleaned.startsWith('//')) continue;
+      const eqMatch = cleaned.match(/[=＝]/);
+      if (eqMatch && typeof eqMatch.index === 'number') {
+        const src = cleaned.slice(0, eqMatch.index).trim().slice(0, 120);
+        const tgt = cleaned.slice(eqMatch.index + 1).trim().slice(0, 120);
+        if (!src) continue;
+        const normKey = src.toLowerCase();
+        if (seenKeys.has(normKey)) continue;
+        seenKeys.add(normKey);
+        if (tgt) entries.push({ type: 'pair', source: src, target: tgt, raw: `${src} = ${tgt}` });
+        else entries.push({ type: 'noun', source: src, raw: src });
+      } else {
+        const noun = cleaned.slice(0, 120);
+        const normKey = noun.toLowerCase();
+        if (seenKeys.has(normKey)) continue;
+        seenKeys.add(normKey);
+        entries.push({ type: 'noun', source: noun, raw: noun });
+      }
+    }
+    return entries;
+  }
+
+  function parseImportedGlossaryText(rawContent, fileName) {
+    const text = String(rawContent || '').replace(/^\uFEFF/, '').trim();
+    const isJsonName = /\.json$/i.test(String(fileName || ''));
+    if (!text) return { entries: [], normalizedText: '', enabledPresetPacks: null };
+    if (isJsonName || text.startsWith('{') || text.startsWith('[')) {
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (err) {
+        throw new Error('JSON 词库文件格式无效，请检查语法');
+      }
+      const rawLines = [];
+      let importedPacks = null;
+      const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+      const collectFromArray = (arr) => {
+        for (let i = 0; i < arr.length; i++) {
+          const item = arr[i];
+          if (typeof item === 'string') {
+            rawLines.push(item);
+          } else if (isObj(item)) {
+            const s = String(item.source || item.term || item.orig || '').trim().slice(0, 120);
+            const t = String(item.target || item.translation || item.trans || '').trim().slice(0, 120);
+            if (s && t) rawLines.push(`${s} = ${t}`);
+            else if (s) rawLines.push(s);
+          }
+        }
+      };
+      if (Array.isArray(parsed)) {
+        collectFromArray(parsed);
+      } else if (isObj(parsed)) {
+        if (Array.isArray(parsed.enabledPresetPacks)) {
+          importedPacks = normalizePresetPackIds(parsed.enabledPresetPacks);
+        }
+        if (Array.isArray(parsed.customEntries)) {
+          collectFromArray(parsed.customEntries);
+        } else if (typeof parsed.customGlossary === 'string') {
+          rawLines.push(...parsed.customGlossary.split(/\r?\n/));
+        } else if (Array.isArray(parsed.customGlossary)) {
+          collectFromArray(parsed.customGlossary);
+        } else if (Array.isArray(parsed.entries)) {
+          collectFromArray(parsed.entries);
+        } else if (Array.isArray(parsed.packs)) {
+          for (let p = 0; p < parsed.packs.length; p++) {
+            if (parsed.packs[p] && Array.isArray(parsed.packs[p].entries)) {
+              collectFromArray(parsed.packs[p].entries);
+            }
+          }
+        } else {
+          throw new Error('未识别的 JSON 词库结构');
+        }
+      } else {
+        throw new Error('JSON 词库根节点须为对象或数组');
+      }
+      const entries = parseGlossaryEntries(rawLines);
+      return {
+        entries,
+        normalizedText: entries.map((e) => e.raw).join('\n'),
+        enabledPresetPacks: importedPacks
+      };
+    }
+    const entries = parseGlossaryEntries(text);
+    return {
+      entries,
+      normalizedText: entries.map((e) => e.raw).join('\n'),
+      enabledPresetPacks: null
+    };
+  }
+
+  function doesKeywordMatchContext(keyword, haystack) {
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.doesKeywordMatchContext === 'function') {
+      return GLOSSARY_DB.doesKeywordMatchContext(keyword, haystack);
+    }
+    const kw = String(keyword || '').trim();
+    const text = String(haystack || '');
+    if (!kw || !text) return false;
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const startsAscii = /^[A-Za-z0-9]/.test(kw);
+    const endsAscii = /[A-Za-z0-9]$/.test(kw);
+    const prefix = startsAscii ? '(?:^|[^A-Za-z0-9])' : '';
+    const suffix = endsAscii ? '(?=$|[^A-Za-z0-9])' : '';
+    try {
+      return new RegExp(prefix + escaped + suffix, 'i').test(text);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function matchAutoPresetPackIds(pageCtx) {
+    if (!pageCtx) return [];
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.matchPageContext === 'function') {
+      return GLOSSARY_DB.matchPageContext(pageCtx).autoMatchedMacroIds;
+    }
+    return [];
+  }
+
+  function cleanPopupContextField(raw, maxLen) {
+    if (raw === null || raw === undefined) return '';
+    const s = String(raw)
+      .replace(/[\u200B-\u200D\uFEFF\x00-\x1F\x7F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return maxLen > 0 ? s.slice(0, maxLen) : s;
+  }
+
+  function cleanPopupDescriptionField(raw, maxLen) {
+    if (raw === null || raw === undefined) return '';
+    let s = String(raw)
+      .replace(/[\u200B-\u200D\uFEFF\x00-\x1F\x7F]/g, ' ')
+      .replace(/https?:\/\/[^\s"'<>)\]]+/gi, ' ')
+      .replace(/\bwww\.[^\s"'<>)\]]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    s = s.replace(/(?:\s*(?:\.\.\.|…)\s*(?:more|显示更多|展开更多)|\s*(?:Show more|Show less|展开|收起))+\s*$/i, '').trim();
+    return maxLen > 0 ? s.slice(0, maxLen).trim() : s;
+  }
+
+  function formatConcisePopupPageContextLines(ctx, maxChars) {
+    const limit = maxChars || MAX_SYSTEM_CONTEXT_CHARS;
+    const lines = [];
+    let used = 0;
+    const chan = ctx && ctx.channel ? cleanPopupContextField(ctx.channel, 52) : '';
+    const title = ctx && ctx.title ? cleanPopupContextField(ctx.title, 120) : '';
+    const tagsArr = (ctx && Array.isArray(ctx.tags)) ? ctx.tags.slice(0, 4) : [];
+    const desc = ctx && ctx.description ? cleanPopupDescriptionField(ctx.description, 220) : '';
+
+    if (chan) {
+      lines.push(`Speaker / Channel: ${chan}`);
+      used += chan.length;
+    }
+    if (title) {
+      const allowTitle = Math.max(40, Math.min(120, limit - used));
+      const tVal = title.slice(0, allowTitle).trim();
+      if (tVal) {
+        lines.push(`Stream / Video Title: ${tVal}`);
+        used += tVal.length;
+      }
+    }
+    if (tagsArr.length > 0 && used < limit - 16) {
+      const tagStr = tagsArr.map((t) => '#' + t).join(', ').slice(0, Math.max(20, limit - used));
+      if (tagStr) {
+        lines.push(`Topic Tags: ${tagStr}`);
+        used += tagStr.length;
+      }
+    }
+    const remForDesc = limit - used;
+    if (desc && remForDesc >= 28 && (!title || desc.toLowerCase() !== title.toLowerCase())) {
+      let summary = desc.slice(0, remForDesc).trim();
+      if (desc.length > remForDesc) {
+        const lastSpace = summary.lastIndexOf(' ');
+        if (lastSpace > Math.floor(remForDesc * 0.6)) summary = summary.slice(0, lastSpace).trim();
+        summary = summary.replace(/[,:;.\-\s]+$/, '') + '…';
+      }
+      if (summary) lines.push(`Description: ${summary}`);
+    }
+    return lines;
+  }
+
+  function buildFallbackContextFromTabTitle(rawTabTitle) {
+    let t = String(rawTabTitle || '')
+      .replace(/[\u200B-\u200D\uFEFF\x00-\x1F\x7F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!t) return null;
+    t = t.replace(/^[（(]\d+[)）]\s*/, '');
+    const stripped = t
+      .replace(/(?:\s*[-_|—]\s*(?:YouTube|Twitch|bilibili|哔哩哔哩(?:_bilibili|\s*\([^)]*\)[^$]*bilibili)?|ニコニコ動画|Niconico))+\s*$/i, '')
+      .trim();
+    if (stripped) t = stripped;
+    t = t.slice(0, 140);
+    if (!t) return null;
+    const tags = [];
+    const seen = new Set();
+    const hashRe = /#([^\s#.,!?;:()[\]{}"'<>【】「」『』]{1,28})/g;
+    let hm;
+    while ((hm = hashRe.exec(t)) !== null && tags.length < 8) {
+      const tg = hm[1].trim();
+      if (tg && !seen.has(tg.toLowerCase())) {
+        seen.add(tg.toLowerCase());
+        tags.push(tg);
+      }
+    }
+    return { title: t, channel: '', tags, description: '' };
+  }
+
   const POPUP_SVGS = {
     eye: '<svg class="ui-icon" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"></path><circle cx="12" cy="12" r="3"></circle></svg>',
     eyeOff: '<svg class="ui-icon" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-6.4 0-10-7-10-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c6.4 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="2" y1="2" x2="22" y2="22"></line></svg>',
@@ -174,9 +448,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['spa_hook.js'], world: 'MAIN' });
         } catch (spaErr) {}
         try {
-          await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['content.js'] });
+          await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['glossary_db.js', 'content.js'] });
         } catch (allErr) {
-          await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+          await chrome.scripting.executeScript({ target: { tabId }, files: ['glossary_db.js', 'content.js'] });
         }
         await new Promise((r) => setTimeout(r, 100));
         return true;
@@ -190,6 +464,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const tabStatusBanner = document.getElementById('tabStatusBanner');
   const tabStatusIcon = document.getElementById('tabStatusIcon');
   const tabStatusText = document.getElementById('tabStatusText');
+  let latestTabPageContext = null;
+  let latestTabAutoPacks = [];
+  let latestTabMatchedSubClusters = [];
+  let syncPopupEnhancedUI = () => {};
 
   function setTabStatusBanner(kind, iconKey, message) {
     if (!tabStatusBanner || !tabStatusText) return;
@@ -243,7 +521,33 @@ document.addEventListener('DOMContentLoaded', async () => {
         const bannerKind = (st.statusKind === 'err' || st.statusKind === 'warn' || st.statusKind === 'ok') ? st.statusKind : 'info';
         const iconKey = bannerKind === 'ok' ? 'checkCircle' : (bannerKind === 'warn' ? 'warn' : (bannerKind === 'err' ? 'error' : 'info'));
         const mediaInfo = typeof st.mediaCount === 'number' ? ` · 媒体 ${st.mediaCount} 个` : '';
+        if (st.pageContext && typeof st.pageContext === 'object') {
+          latestTabPageContext = st.pageContext;
+        }
+        if (Array.isArray(st.autoMatchedPacks) && st.autoMatchedPacks.length > 0) {
+          latestTabAutoPacks = normalizePresetPackIds(st.autoMatchedPacks);
+        } else if (latestTabPageContext) {
+          latestTabAutoPacks = matchAutoPresetPackIds(latestTabPageContext);
+        }
+        if (Array.isArray(st.matchedSubClusters) && st.matchedSubClusters.length > 0) {
+          latestTabMatchedSubClusters = st.matchedSubClusters;
+        } else if (latestTabPageContext && GLOSSARY_DB && typeof GLOSSARY_DB.matchPageContext === 'function') {
+          latestTabMatchedSubClusters = GLOSSARY_DB.matchPageContext(latestTabPageContext).matchedSubClusters;
+        } else {
+          latestTabMatchedSubClusters = [];
+        }
+        syncPopupEnhancedUI();
         setTabStatusBanner(bannerKind, iconKey, `当前页状态：${stateLabel}（音源：${modeLabel}${mediaInfo}）`);
+      } else if (tab && tab.title) {
+        const fbCtx = buildFallbackContextFromTabTitle(tab.title);
+        if (fbCtx) {
+          latestTabPageContext = fbCtx;
+          latestTabAutoPacks = matchAutoPresetPackIds(fbCtx);
+          latestTabMatchedSubClusters = (GLOSSARY_DB && typeof GLOSSARY_DB.matchPageContext === 'function')
+            ? GLOSSARY_DB.matchPageContext(fbCtx).matchedSubClusters
+            : [];
+          syncPopupEnhancedUI();
+        }
       }
     }
   }
@@ -347,6 +651,32 @@ document.addEventListener('DOMContentLoaded', async () => {
   const blur = document.getElementById('blur');
   const blurVal = document.getElementById('blurVal');
   const btnSave = document.getElementById('btnSave');
+
+  const modeStatusBadge = document.getElementById('modeStatusBadge');
+  const btnModeStandard = document.getElementById('btnModeStandard');
+  const btnModeEnhanced = document.getElementById('btnModeEnhanced');
+  const translationModeHint = document.getElementById('translationModeHint');
+  const enhancedConfigPanel = document.getElementById('enhancedConfigPanel');
+  const btnAutoPageContext = document.getElementById('btnAutoPageContext');
+  const btnAutoPresetGlossary = document.getElementById('btnAutoPresetGlossary');
+  const popupContextPreview = document.getElementById('popupContextPreview');
+  const presetActiveSummary = document.getElementById('presetActiveSummary');
+  const customGlossaryInput = document.getElementById('customGlossaryInput');
+  const customGlossaryCount = document.getElementById('customGlossaryCount');
+  const btnImportGlossary = document.getElementById('btnImportGlossary');
+  const btnExportTxt = document.getElementById('btnExportTxt');
+  const btnExportJson = document.getElementById('btnExportJson');
+  const glossaryFileInput = document.getElementById('glossaryFileInput');
+  const glossaryActionHint = document.getElementById('glossaryActionHint');
+  const presetPackCards = BUILT_IN_GLOSSARY_PACKS
+    .map((pk) => document.getElementById('packCard_' + pk.id))
+    .filter(Boolean);
+
+  let currentTranslationMode = 'standard';
+  let currentAutoPageContext = true;
+  let currentAutoPresetGlossary = false;
+  let currentEnabledPresetPacks = [];
+  let hasEnhancementControls = !!(btnModeStandard && btnModeEnhanced);
 
   let savedCustomHost = '';
   const popupDropdowns = [];
@@ -801,9 +1131,154 @@ document.addEventListener('DOMContentLoaded', async () => {
       blur.value = blVal;
       blurVal.textContent = blVal;
     }
+
+    currentTranslationMode = nextCfg.translationMode === 'enhanced' ? 'enhanced' : 'standard';
+    currentAutoPageContext = typeof nextCfg.autoPageContext === 'boolean' ? nextCfg.autoPageContext : true;
+    currentAutoPresetGlossary = typeof nextCfg.autoPresetGlossary === 'boolean' ? nextCfg.autoPresetGlossary : false;
+    if (Array.isArray(nextCfg.enabledPresetPacks)) {
+      currentEnabledPresetPacks = normalizePresetPackIds(nextCfg.enabledPresetPacks);
+    } else {
+      currentEnabledPresetPacks = [];
+    }
+    if (customGlossaryInput && (!skipActive || activeEl !== customGlossaryInput)) {
+      customGlossaryInput.value = typeof nextCfg.customGlossary === 'string' ? nextCfg.customGlossary : '';
+    }
+
+    syncPopupEnhancedUI();
     syncPopupSelects();
     updateHostState();
   }
+
+  syncPopupEnhancedUI = () => {
+    if (!hasEnhancementControls) return;
+    const isEnh = currentTranslationMode === 'enhanced';
+    btnModeStandard.classList.toggle('active', !isEnh);
+    btnModeStandard.setAttribute('aria-pressed', !isEnh ? 'true' : 'false');
+    btnModeEnhanced.classList.toggle('active', isEnh);
+    btnModeEnhanced.setAttribute('aria-pressed', isEnh ? 'true' : 'false');
+    if (modeStatusBadge) {
+      modeStatusBadge.textContent = isEnh ? '语境增强' : '纯净基线';
+      modeStatusBadge.classList.toggle('enhanced', isEnh);
+    }
+    if (translationModeHint) {
+      translationModeHint.textContent = isEnh
+        ? '在会话握手阶段注入网页标题/频道/简介语境与动态精选 Top-100 术语表（运行中调整将平滑轮转会话）。'
+        : '不注入特定网页语境与术语表，使用原生纯净同传基线。';
+    }
+    if (enhancedConfigPanel) {
+      enhancedConfigPanel.classList.toggle('show', isEnh);
+    }
+    if (btnAutoPageContext) {
+      btnAutoPageContext.classList.toggle('active', currentAutoPageContext);
+      btnAutoPageContext.setAttribute('aria-pressed', currentAutoPageContext ? 'true' : 'false');
+    }
+    if (btnAutoPresetGlossary) {
+      btnAutoPresetGlossary.classList.toggle('active', currentAutoPresetGlossary);
+      btnAutoPresetGlossary.setAttribute('aria-pressed', currentAutoPresetGlossary ? 'true' : 'false');
+    }
+
+    const customEntriesNow = customGlossaryInput ? parseGlossaryEntries(customGlossaryInput.value) : [];
+    const dynamicSelection = (GLOSSARY_DB && typeof GLOSSARY_DB.selectDynamicGlossary === 'function')
+      ? GLOSSARY_DB.selectDynamicGlossary({
+        pageCtx: latestTabPageContext || {},
+        manualPackIds: currentEnabledPresetPacks,
+        autoPresetGlossary: currentAutoPresetGlossary,
+        customEntries: customEntriesNow,
+        maxPresetEntries: MAX_PRESET_GLOSSARY_INJECT
+      })
+      : null;
+
+    const effectiveAutoPacks = currentAutoPresetGlossary
+      ? ((latestTabAutoPacks && latestTabAutoPacks.length > 0)
+        ? latestTabAutoPacks
+        : (dynamicSelection ? dynamicSelection.autoMatchedMacroIds : []))
+      : [];
+
+    const effectiveMatchedSubs = (dynamicSelection && dynamicSelection.activeMatchedSubClusters.length > 0)
+      ? dynamicSelection.activeMatchedSubClusters
+      : (currentAutoPresetGlossary
+        ? ((latestTabMatchedSubClusters && latestTabMatchedSubClusters.length > 0)
+          ? latestTabMatchedSubClusters
+          : (dynamicSelection ? dynamicSelection.matchedSubClusters : []))
+        : []);
+
+    if (popupContextPreview) {
+      const injectedPreset = dynamicSelection ? dynamicSelection.injectedPresetCount : 0;
+      const customCnt = customEntriesNow.length;
+      const injectedLabel = (injectedPreset > 0 || customCnt > 0)
+        ? `已注入 ${injectedPreset} 条预设${customCnt > 0 ? ` + ${customCnt} 条自定义` : ''}词条`
+        : '';
+
+      if (!currentAutoPageContext && !currentAutoPresetGlossary) {
+        popupContextPreview.textContent = injectedLabel
+          ? `网页语境：已关闭自动网页提取 · ${injectedLabel}`
+          : '网页语境：已关闭自动网页提取，仅注入勾选的预设包与自定义词条。';
+      } else if (latestTabPageContext && (latestTabPageContext.title || latestTabPageContext.channel || latestTabPageContext.description)) {
+        const parts = [];
+        if (currentAutoPageContext) {
+          if (latestTabPageContext.channel) parts.push(`频道：${latestTabPageContext.channel}`);
+          if (latestTabPageContext.title) parts.push(`标题：${latestTabPageContext.title}`);
+          if (Array.isArray(latestTabPageContext.tags) && latestTabPageContext.tags.length > 0) {
+            parts.push(`标签：#${latestTabPageContext.tags.slice(0, 4).join(' #')}`);
+          }
+        }
+        if (effectiveMatchedSubs.length > 0) {
+          const subNames = effectiveMatchedSubs.slice(0, 2).map((s) => s.name);
+          parts.push(`命中子领域：${subNames.join('、')}`);
+        } else if (currentAutoPresetGlossary && effectiveAutoPacks.length > 0) {
+          const names = BUILT_IN_GLOSSARY_PACKS
+            .filter((p) => effectiveAutoPacks.includes(p.id))
+            .map((p) => p.shortName);
+          if (names.length > 0) parts.push(`自动命中：${names.join('、')}`);
+        }
+        if (injectedLabel) parts.push(injectedLabel);
+        popupContextPreview.textContent = parts.length > 0
+          ? parts.join(' · ')
+          : '网页语境：当前标签页未检测到标题、频道或简介信息';
+      } else if (isStandaloneOptionsTab) {
+        popupContextPreview.textContent = injectedLabel
+          ? `网页语境：在各视频标签页运行时自动提取标题与简介 · ${injectedLabel}`
+          : '网页语境：在各视频标签页运行时将自动提取对应标题、频道与简介信息。';
+      } else {
+        popupContextPreview.textContent = injectedLabel
+          ? `网页语境：打开视频页面后自动提取标题与简介 · ${injectedLabel}`
+          : '网页语境：打开视频页面后将自动提取标题、频道与简介语境。';
+      }
+    }
+
+    const autoSet = currentAutoPresetGlossary ? new Set(effectiveAutoPacks) : new Set();
+    for (let i = 0; i < presetPackCards.length; i++) {
+      const card = presetPackCards[i];
+      const pid = (card.dataset && card.dataset.pack) || (typeof card.getAttribute === 'function' ? card.getAttribute('data-pack') : '');
+      const isManual = currentEnabledPresetPacks.includes(pid);
+      const isAuto = autoSet.has(pid);
+      card.classList.toggle('active', isManual);
+      card.classList.toggle('auto-hit', isAuto && !isManual);
+      card.setAttribute('aria-pressed', isManual ? 'true' : 'false');
+      const metaEl = card.querySelector('.pack-card-meta');
+      const packDef = BUILT_IN_GLOSSARY_PACKS.find((p) => p.id === pid);
+      if (metaEl && packDef) {
+        const totalEntries = typeof packDef.entryCount === 'number'
+          ? packDef.entryCount
+          : (Array.isArray(packDef.entries) ? packDef.entries.length : 0);
+        const countStr = `${totalEntries} 词条`;
+        metaEl.textContent = isManual
+          ? `${countStr} · 已勾选`
+          : (isAuto ? `${countStr} · 自动命中` : countStr);
+      }
+    }
+
+    if (presetActiveSummary) {
+      const autoExtra = Array.from(autoSet).filter((id) => !currentEnabledPresetPacks.includes(id)).length;
+      presetActiveSummary.textContent = autoExtra > 0
+        ? `已选 ${currentEnabledPresetPacks.length} 个包 (+${autoExtra} 自动)`
+        : `已选 ${currentEnabledPresetPacks.length} 个包`;
+    }
+
+    if (customGlossaryCount && customGlossaryInput) {
+      customGlossaryCount.textContent = `${customEntriesNow.length} 条有效词条`;
+    }
+  };
 
   // Populate UI from loaded configuration
   applyStoredConfigToUI(cfg, { skipActiveInputs: false });
@@ -877,6 +1352,166 @@ document.addEventListener('DOMContentLoaded', async () => {
     notifyActiveTabDebounced({ blur: parseInt(blur.value, 10) });
   });
 
+  function setGlossaryActionHint(msg, isError = false) {
+    if (!glossaryActionHint) return;
+    glossaryActionHint.textContent = msg || '';
+    glossaryActionHint.style.color = isError ? '#f87171' : '#34d399';
+  }
+
+  if (btnModeStandard) {
+    btnModeStandard.addEventListener('click', () => {
+      if (currentTranslationMode === 'standard') return;
+      currentTranslationMode = 'standard';
+      syncPopupEnhancedUI();
+      invalidateStaleTestResult();
+      notifyActiveTabDebounced({ translationMode: 'standard' });
+    });
+  }
+
+  if (btnModeEnhanced) {
+    btnModeEnhanced.addEventListener('click', () => {
+      if (currentTranslationMode === 'enhanced') return;
+      currentTranslationMode = 'enhanced';
+      syncPopupEnhancedUI();
+      invalidateStaleTestResult();
+      notifyActiveTabDebounced({ translationMode: 'enhanced' });
+    });
+  }
+
+  if (btnAutoPageContext) {
+    btnAutoPageContext.addEventListener('click', () => {
+      currentAutoPageContext = !currentAutoPageContext;
+      syncPopupEnhancedUI();
+      invalidateStaleTestResult();
+      notifyActiveTabDebounced({ autoPageContext: currentAutoPageContext });
+    });
+  }
+
+  if (btnAutoPresetGlossary) {
+    btnAutoPresetGlossary.addEventListener('click', () => {
+      currentAutoPresetGlossary = !currentAutoPresetGlossary;
+      if (latestTabPageContext) {
+        if (!Array.isArray(latestTabAutoPacks) || latestTabAutoPacks.length === 0) {
+          latestTabAutoPacks = matchAutoPresetPackIds(latestTabPageContext);
+        }
+        if ((!Array.isArray(latestTabMatchedSubClusters) || latestTabMatchedSubClusters.length === 0) && GLOSSARY_DB && typeof GLOSSARY_DB.matchPageContext === 'function') {
+          latestTabMatchedSubClusters = GLOSSARY_DB.matchPageContext(latestTabPageContext).matchedSubClusters;
+        }
+      }
+      syncPopupEnhancedUI();
+      invalidateStaleTestResult();
+      notifyActiveTabDebounced({ autoPresetGlossary: currentAutoPresetGlossary });
+    });
+  }
+
+  for (let i = 0; i < presetPackCards.length; i++) {
+    const card = presetPackCards[i];
+    card.addEventListener('click', () => {
+      const pid = (card.dataset && card.dataset.pack) || (typeof card.getAttribute === 'function' ? card.getAttribute('data-pack') : '');
+      if (!pid) return;
+      const idx = currentEnabledPresetPacks.indexOf(pid);
+      if (idx === -1) currentEnabledPresetPacks.push(pid);
+      else currentEnabledPresetPacks.splice(idx, 1);
+      syncPopupEnhancedUI();
+      invalidateStaleTestResult();
+      notifyActiveTabDebounced({ enabledPresetPacks: currentEnabledPresetPacks.slice() });
+    });
+  }
+
+  if (customGlossaryInput) {
+    customGlossaryInput.addEventListener('input', () => {
+      syncPopupEnhancedUI();
+      invalidateStaleTestResult();
+      notifyActiveTabDebounced({ customGlossary: customGlossaryInput.value });
+    });
+  }
+
+  function triggerPopupDownload(content, filename, mimeType) {
+    try {
+      if (typeof Blob === 'function' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+        const blob = new Blob([content], { type: mimeType });
+        const dlUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = dlUrl;
+        a.download = filename;
+        a.style.display = 'none';
+        if (document.body) document.body.appendChild(a);
+        a.click();
+        if (a.parentNode) a.remove();
+        setTimeout(() => {
+          try { URL.revokeObjectURL(dlUrl); } catch (e) {}
+        }, 1000);
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  if (btnExportTxt && customGlossaryInput) {
+    btnExportTxt.addEventListener('click', () => {
+      const entries = parseGlossaryEntries(customGlossaryInput.value);
+      const txt = entries.map((e) => e.raw).join('\n');
+      if (!txt) {
+        setGlossaryActionHint('当前自定义术语表为空，请先输入词条后再导出。', true);
+        return;
+      }
+      const ok = triggerPopupDownload(txt + '\n', 'gemini-live-glossary.txt', 'text/plain;charset=utf-8');
+      setGlossaryActionHint(ok ? `已导出 ${entries.length} 条自定义词条 (TXT)` : '导出失败', !ok);
+    });
+  }
+
+  if (btnExportJson && customGlossaryInput) {
+    btnExportJson.addEventListener('click', () => {
+      const entries = parseGlossaryEntries(customGlossaryInput.value);
+      const payload = {
+        schema: 'gemini-live-translator-glossary-v1',
+        exportedAt: new Date().toISOString(),
+        enabledPresetPacks: currentEnabledPresetPacks.slice(),
+        customEntries: entries.map((e) => e.raw)
+      };
+      const ok = triggerPopupDownload(JSON.stringify(payload, null, 2), 'gemini-live-glossary.json', 'application/json;charset=utf-8');
+      setGlossaryActionHint(ok ? `已导出 JSON 词库配置 (${entries.length} 条自定义词条)` : '导出失败', !ok);
+    });
+  }
+
+  if (btnImportGlossary && glossaryFileInput && customGlossaryInput) {
+    btnImportGlossary.addEventListener('click', () => {
+      glossaryFileInput.value = '';
+      glossaryFileInput.click();
+    });
+    glossaryFileInput.addEventListener('change', async () => {
+      const file = glossaryFileInput.files && glossaryFileInput.files[0];
+      if (!file) return;
+      if (file.size > 512 * 1024) {
+        setGlossaryActionHint('词库文件超过 512KB 大小限制。', true);
+        return;
+      }
+      try {
+        const rawText = typeof file.text === 'function'
+          ? await file.text()
+          : await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ''));
+            reader.onerror = () => reject(new Error('文件读取失败'));
+            reader.readAsText(file, 'utf-8');
+          });
+        const imported = parseImportedGlossaryText(rawText, file.name);
+        customGlossaryInput.value = imported.normalizedText;
+        const patch = { customGlossary: imported.normalizedText };
+        if (Array.isArray(imported.enabledPresetPacks)) {
+          currentEnabledPresetPacks = imported.enabledPresetPacks.slice();
+          patch.enabledPresetPacks = currentEnabledPresetPacks.slice();
+        }
+        syncPopupEnhancedUI();
+        invalidateStaleTestResult();
+        notifyActiveTabDebounced(patch);
+        setGlossaryActionHint(`已成功导入 ${imported.entries.length} 条术语。`, false);
+      } catch (err) {
+        setGlossaryActionHint(sanitizeErrorMessage(err && err.message ? err.message : err), true);
+      }
+    });
+  }
+
   let saveBtnResetTimer = null;
   function flashSaveButton(iconKey, text, state) {
     if (isPopupClosed()) return;
@@ -936,6 +1571,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       opacity: parseInt(opacity.value, 10) / 100,
       blur: parseInt(blur.value, 10)
     };
+    if (hasEnhancementControls) {
+      newConfig.translationMode = currentTranslationMode;
+      newConfig.autoPageContext = currentAutoPageContext;
+      newConfig.autoPresetGlossary = currentAutoPresetGlossary;
+      newConfig.enabledPresetPacks = currentEnabledPresetPacks.slice();
+      if (customGlossaryInput) {
+        newConfig.customGlossary = customGlossaryInput.value;
+      }
+    }
 
     persistPopupConfigPatch(newConfig, ['forcedDomain']).then((patchRes) => {
       if (isPopupClosed()) return;
@@ -1146,21 +1790,108 @@ document.addEventListener('DOMContentLoaded', async () => {
       const isTranslate = /live-translate/i.test(model);
       let setup;
       if (isTranslate) {
+        const tgtCode = mapTargetLanguageCode(targetLang.value);
+        const tgtLabelMap = {
+          'zh-Hans': 'Simplified Chinese (zh-Hans)',
+          'zh-Hant': 'Traditional Chinese (zh-Hant)',
+          en: 'English (en)',
+          ja: 'Japanese (ja)',
+          ko: 'Korean (ko)',
+          fr: 'French (fr)',
+          de: 'German (de)',
+          es: 'Spanish (es)',
+          ru: 'Russian (ru)'
+        };
+        const tgtLabel = tgtLabelMap[tgtCode] || tgtCode;
+        const inputTrans = {};
+        const srcVal = String((sourceLang && sourceLang.value) || '').trim().toLowerCase();
+        if (srcVal && !/自动识别|auto/i.test(srcVal)) {
+          if (srcVal.includes('日语') || srcVal.includes('日語') || srcVal.includes('japanese') || /^ja(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['ja-JP'];
+          else if (srcVal.includes('英语') || srcVal.includes('english') || /^en(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['en-US'];
+          else if (srcVal.includes('韩语') || srcVal.includes('韓語') || srcVal.includes('korean') || /^ko(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['ko-KR'];
+          else if (srcVal.includes('繁體') || srcVal.includes('繁体') || srcVal.includes('traditional') || srcVal.includes('zh-tw') || srcVal.includes('zh-hant')) inputTrans.languageCodes = ['zh-TW'];
+          else if (srcVal.includes('中文') || srcVal.includes('chinese') || /^zh(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['zh-CN'];
+          else if (srcVal.includes('法语') || srcVal.includes('法語') || srcVal.includes('french') || /^fr(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['fr-FR'];
+          else if (srcVal.includes('德语') || srcVal.includes('德語') || srcVal.includes('german') || /^de(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['de-DE'];
+          else if (srcVal.includes('西班牙') || srcVal.includes('spanish') || /^es(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['es-ES'];
+          else if (srcVal.includes('俄语') || srcVal.includes('俄語') || srcVal.includes('russian') || /^ru(?:\b|-)/.test(srcVal)) inputTrans.languageCodes = ['ru-RU'];
+        }
         setup = {
           setup: {
             model: 'models/' + model,
             generationConfig: {
               responseModalities: ['AUDIO'],
               translationConfig: {
-                targetLanguageCode: mapTargetLanguageCode(targetLang.value),
+                targetLanguageCode: tgtCode,
                 echoTargetLanguage: true
               }
             },
-            inputAudioTranscription: {},
+            inputAudioTranscription: inputTrans,
             outputAudioTranscription: {},
             contextWindowCompression: { slidingWindow: {} }
           }
         };
+        if (hasEnhancementControls && currentTranslationMode === 'enhanced') {
+          const isZhTarget = tgtCode === 'zh-Hans' || tgtCode === 'zh-Hant';
+          const customEntries = customGlossaryInput ? parseGlossaryEntries(customGlossaryInput.value) : [];
+          const customKeySet = new Set(customEntries.map((e) => e.source.toLowerCase()));
+          const dynamic = (GLOSSARY_DB && typeof GLOSSARY_DB.selectDynamicGlossary === 'function')
+            ? GLOSSARY_DB.selectDynamicGlossary({
+              pageCtx: latestTabPageContext || {},
+              manualPackIds: currentEnabledPresetPacks,
+              autoPresetGlossary: currentAutoPresetGlossary,
+              customEntries,
+              maxPresetEntries: MAX_PRESET_GLOSSARY_INJECT
+            })
+            : null;
+          const pairs = [];
+          const nouns = [];
+          const seenNouns = new Set();
+          const registerHints = (isZhTarget && dynamic && Array.isArray(dynamic.registerHints)) ? dynamic.registerHints.slice() : [];
+          const domainTerms = [];
+          const seenDomain = new Set();
+          const addN = (s) => {
+            const k = s.toLowerCase();
+            if (!seenNouns.has(k)) { seenNouns.add(k); nouns.push(s); }
+          };
+          const presetList = dynamic ? dynamic.selectedPresetEntries.slice(0, MAX_PRESET_GLOSSARY_INJECT) : [];
+          for (let j = 0; j < presetList.length; j++) {
+            const pe = presetList[j];
+            if (customKeySet.has(pe.source.toLowerCase())) continue;
+            if (pe.type === 'noun') addN(pe.source);
+            else if (isZhTarget) pairs.push(`${pe.source} = ${pe.target}`);
+            else if (!seenDomain.has(pe.source.toLowerCase())) {
+              seenDomain.add(pe.source.toLowerCase());
+              domainTerms.push(pe.source);
+            }
+          }
+          for (let i = 0; i < customEntries.length; i++) {
+            if (customEntries[i].type === 'pair') pairs.push(`${customEntries[i].source} = ${customEntries[i].target}`);
+            else addN(customEntries[i].source);
+          }
+          const sysParts = [`Translate all incoming spoken audio into ${tgtLabel} for real-time simultaneous interpretation. Output only the natural translation of the spoken audio.`];
+          if (currentAutoPageContext && latestTabPageContext) {
+            const cLines = formatConcisePopupPageContextLines(latestTabPageContext, MAX_SYSTEM_CONTEXT_CHARS);
+            if (cLines.length > 0) {
+              sysParts.push(`Page Context (use solely to disambiguate homophones, names, and domain terms):\n${cLines.join('\n')}`);
+            }
+          }
+          if (registerHints.length > 0) {
+            let regLine = `Translation Register: ${registerHints.join(' ')}`;
+            if (tgtCode === 'zh-Hant') regLine += ' Render Chinese output and glossary terms in Traditional Chinese script (zh-Hant).';
+            sysParts.push(regLine);
+          } else if (tgtCode === 'zh-Hant') {
+            sysParts.push('Render Chinese output and glossary terms in Traditional Chinese script (zh-Hant).');
+          }
+          if (domainTerms.length > 0) {
+            sysParts.push(`Source Domain Terms (recognize accurately and translate naturally into ${tgtLabel}): ${domainTerms.join(', ')}`);
+          }
+          if (pairs.length > 0) sysParts.push(`Fixed Glossary Rules (when the source term is spoken, use the specified target translation):\n${pairs.join('\n')}`);
+          if (nouns.length > 0) sysParts.push(`Untranslated Proper Nouns (keep unchanged as-is when spoken): ${nouns.join(', ')}`);
+          setup.setup.systemInstruction = {
+            parts: [{ text: sysParts.join('\n\n') }]
+          };
+        }
       } else {
         setup = {
           setup: {

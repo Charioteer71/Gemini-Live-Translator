@@ -76,8 +76,8 @@
 
   const MODEL_TRANSLATE = 'models/gemini-3.5-live-translate-preview';
   const EXTENSION_VERSION = (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getManifest === 'function')
-    ? (chrome.runtime.getManifest().version || '1.1.0')
-    : '1.1.0';
+    ? (chrome.runtime.getManifest().version || '1.3.0')
+    : '1.3.0';
 
   // 握手/重连/轮转参数（依据网关实测 0.5s~13.5s 握手波动放宽）
   const CONNECT_TIMEOUT_MS = 30000;
@@ -412,6 +412,78 @@
         };
       }
     }
+    if (next.translationMode !== undefined) {
+      next.translationMode = next.translationMode === 'enhanced' ? 'enhanced' : 'standard';
+    }
+    if (next.autoPageContext !== undefined) {
+      next.autoPageContext = typeof next.autoPageContext === 'boolean' ? next.autoPageContext : true;
+    }
+    if (next.autoPresetGlossary !== undefined) {
+      next.autoPresetGlossary = typeof next.autoPresetGlossary === 'boolean' ? next.autoPresetGlossary : false;
+    }
+    if (next.enabledPresetPacks !== undefined) {
+      const allowedPacks = [
+        'ai_tech',
+        'vtuber_acgn',
+        'media_podcast_culture',
+        'gaming_esports_sim',
+        'history_politics_econ',
+        'science_medicine_academia'
+      ];
+      const legacyPackMap = {
+        ai_tech: 'ai_tech',
+        jp_stream_music: 'vtuber_acgn',
+        gaming_sim: 'gaming_esports_sim',
+        academic_finance: 'history_politics_econ'
+      };
+      if (!Array.isArray(next.enabledPresetPacks)) {
+        next.enabledPresetPacks = [];
+      } else {
+        const seenP = {};
+        const validP = [];
+        for (let i = 0; i < next.enabledPresetPacks.length; i++) {
+          const rawPid = next.enabledPresetPacks[i];
+          if (typeof rawPid !== 'string') continue;
+          const pid = allowedPacks.indexOf(rawPid) !== -1
+            ? rawPid
+            : (legacyPackMap[rawPid] || '');
+          if (pid && allowedPacks.indexOf(pid) !== -1 && !seenP[pid]) {
+            seenP[pid] = true;
+            validP.push(pid);
+          }
+        }
+        next.enabledPresetPacks = validP;
+      }
+    }
+    if (next.customGlossary !== undefined) {
+      let rawGloss = '';
+      if (typeof next.customGlossary === 'string') {
+        rawGloss = next.customGlossary;
+      } else if (Array.isArray(next.customGlossary)) {
+        rawGloss = next.customGlossary.filter((x) => typeof x === 'string' || typeof x === 'number').join('\n');
+      }
+      if (!rawGloss) {
+        next.customGlossary = '';
+      } else {
+        const linesG = rawGloss
+          .replace(/[\u200B-\u200D\uFEFF\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+          .replace(/\r\n?/g, '\n')
+          .split('\n');
+        const outG = [];
+        let countG = 0;
+        for (let i = 0; i < linesG.length; i++) {
+          const ln = linesG[i].replace(/\s+$/g, '').slice(0, 260);
+          if (ln.trim()) {
+            countG++;
+            if (countG > 500) break;
+          } else if (outG.length > 0 && outG[outG.length - 1] === '') {
+            continue;
+          }
+          outG.push(ln);
+        }
+        next.customGlossary = outG.join('\n').trim().slice(0, 32768);
+      }
+    }
     next.schemaVersion = DEFAULT_CONFIG.schemaVersion;
     return next;
   }
@@ -568,10 +640,623 @@
   let docPiPRef = null;
   let docPiPPageHideTarget = null;
   let onDocPiPWindowPageHide = null;
+  let customGlossaryRotateTimer = null;
 
   // ========================================================================
-  // 3. 静态辅助指令（仅 protocolMode === 'legacy' 回退时使用）
+  // 3. 语境识别、内置 v1.3.0 分层预设词库与动态 Top-100 术语增强系统
   // ========================================================================
+
+  const GLOSSARY_DB = (typeof globalThis !== 'undefined' && globalThis.GEMINI_LIVE_GLOSSARY_DB)
+    ? globalThis.GEMINI_LIVE_GLOSSARY_DB
+    : ((typeof window !== 'undefined' && window.GEMINI_LIVE_GLOSSARY_DB) ? window.GEMINI_LIVE_GLOSSARY_DB : null);
+
+  const MAX_PRESET_GLOSSARY_INJECT = (GLOSSARY_DB && typeof GLOSSARY_DB.maxPresetGlossaryInject === 'number')
+    ? GLOSSARY_DB.maxPresetGlossaryInject
+    : 100;
+
+  const MAX_SYSTEM_CONTEXT_CHARS = 260;
+
+  const LEGACY_PRESET_PACK_MAP = (GLOSSARY_DB && GLOSSARY_DB.legacyPackMigrationMap) || {
+    ai_tech: 'ai_tech',
+    jp_stream_music: 'vtuber_acgn',
+    gaming_sim: 'gaming_esports_sim',
+    academic_finance: 'history_politics_econ'
+  };
+
+  const BUILT_IN_GLOSSARY_PACKS = (GLOSSARY_DB && Array.isArray(GLOSSARY_DB.macros))
+    ? GLOSSARY_DB.macros
+    : [
+      { id: 'ai_tech', shortName: 'AI 与前沿科技', name: 'AI、软件与前沿科技', description: '涵盖前沿大模型、Agent 协议、云原生架构与半导体硬件术语', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'vtuber_acgn', shortName: '虚拟主播与ACGN', name: '虚拟主播与日系ACGN', description: '涵盖虚拟主播、神椿虚拟歌手、歌回杂谈与动画漫画术语', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'media_podcast_culture', shortName: '影视播客与文化', name: '影视播客与互联网文化', description: '涵盖影视制片、深度播客与英日互联网文化表达', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'gaming_esports_sim', shortName: '游戏电竞与军武', name: '游戏电竞与硬核模拟', description: '涵盖3A独立新作、电竞解说与军武防务模拟术语', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'history_politics_econ', shortName: '历史政经与社科', name: '历史政治、社科哲学与财经', description: '涵盖历史政治、社科哲学与宏观财经分析术语', registerHint: '', subClusterCount: 0, entryCount: 0 },
+      { id: 'science_medicine_academia', shortName: '自然科学与公开课', name: '自然科学、医学与公开课', description: '涵盖自然科学、循证医学与高校公开课术语', registerHint: '', subClusterCount: 0, entryCount: 0 }
+    ];
+
+  function normalizePresetPackIds(rawIds) {
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.normalizePresetPackIds === 'function') {
+      return GLOSSARY_DB.normalizePresetPackIds(rawIds);
+    }
+    if (!Array.isArray(rawIds)) return [];
+    const seen = new Set();
+    const out = [];
+    for (let i = 0; i < rawIds.length; i++) {
+      const raw = rawIds[i];
+      if (typeof raw !== 'string') continue;
+      const mapped = BUILT_IN_GLOSSARY_PACKS.some((p) => p.id === raw)
+        ? raw
+        : (LEGACY_PRESET_PACK_MAP[raw] || '');
+      if (mapped && !seen.has(mapped) && BUILT_IN_GLOSSARY_PACKS.some((p) => p.id === mapped)) {
+        seen.add(mapped);
+        out.push(mapped);
+      }
+    }
+    return out;
+  }
+
+  function getEffectiveTranslationMode(cfg) {
+    return (cfg && cfg.translationMode === 'enhanced') ? 'enhanced' : 'standard';
+  }
+
+  function isAutoPageContextEnabled(cfg) {
+    return (cfg && typeof cfg.autoPageContext === 'boolean') ? cfg.autoPageContext : true;
+  }
+
+  function isAutoPresetGlossaryEnabled(cfg) {
+    return (cfg && typeof cfg.autoPresetGlossary === 'boolean') ? cfg.autoPresetGlossary : false;
+  }
+
+  function getEnabledPresetPackIds(cfg) {
+    if (!cfg || !Array.isArray(cfg.enabledPresetPacks)) return [];
+    return normalizePresetPackIds(cfg.enabledPresetPacks);
+  }
+
+  function getCustomGlossaryRaw(cfg) {
+    return (cfg && typeof cfg.customGlossary === 'string') ? cfg.customGlossary : '';
+  }
+
+  function cleanContextField(raw, maxLen) {
+    if (raw === null || raw === undefined) return '';
+    const s = String(raw)
+      .replace(/[\u200B-\u200D\uFEFF\x00-\x1F\x7F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return maxLen > 0 ? s.slice(0, maxLen) : s;
+  }
+
+  function cleanDescriptionField(raw, maxLen) {
+    if (raw === null || raw === undefined) return '';
+    let s = String(raw)
+      .replace(/[\u200B-\u200D\uFEFF\x00-\x1F\x7F]/g, ' ')
+      .replace(/https?:\/\/[^\s"'<>)\]]+/gi, ' ')
+      .replace(/\bwww\.[^\s"'<>)\]]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    s = s.replace(/(?:\s*(?:\.\.\.|…)\s*(?:more|显示更多|展开更多)|\s*(?:Show more|Show less|展开|收起))+\s*$/i, '').trim();
+    return maxLen > 0 ? s.slice(0, maxLen).trim() : s;
+  }
+
+  function readFirstSelectorText(selectors, maxLen, cleaner) {
+    if (typeof document === 'undefined' || typeof document.querySelector !== 'function') return '';
+    const cleanFn = typeof cleaner === 'function' ? cleaner : cleanContextField;
+    for (let i = 0; i < selectors.length; i++) {
+      let el = null;
+      try {
+        el = document.querySelector(selectors[i]);
+      } catch (e) {
+        el = null;
+      }
+      if (!el || isInsideExtensionHost(el)) continue;
+      const tag = el.tagName ? String(el.tagName).toUpperCase() : '';
+      const rawVal = tag === 'META'
+        ? (typeof el.getAttribute === 'function' ? el.getAttribute('content') : el.content)
+        : el.textContent;
+      const cleaned = cleanFn(rawVal, maxLen);
+      if (cleaned) return cleaned;
+    }
+    return '';
+  }
+
+  function extractPageContext() {
+    if (typeof document === 'undefined') {
+      return { title: '', channel: '', tags: [], description: '' };
+    }
+
+    let rawTitle = readFirstSelectorText([
+      'h1.ytd-watch-metadata yt-formatted-string',
+      '#above-the-fold h1 yt-formatted-string',
+      '#title h1 yt-formatted-string',
+      'h1.video-title',
+      '[data-a-target="stream-title"]',
+      '.live-title .text',
+      'meta[property="og:title"]',
+      'meta[name="twitter:title"]'
+    ], 160);
+
+    if (!rawTitle && document.title) {
+      rawTitle = cleanContextField(document.title, 180);
+    }
+    if (!rawTitle && typeof document.querySelector === 'function') {
+      const titleNode = document.querySelector('title');
+      if (titleNode && titleNode.textContent) {
+        rawTitle = cleanContextField(titleNode.textContent, 180);
+      }
+    }
+
+    if (rawTitle) {
+      rawTitle = rawTitle.replace(/^[（(]\d+[)）]\s*/, '');
+      const stripped = rawTitle
+        .replace(/(?:\s*[-_|—]\s*(?:YouTube|Twitch|bilibili|哔哩哔哩(?:_bilibili|\s*\([^)]*\)[^$]*bilibili)?|ニコニコ動画|Niconico))+\s*$/i, '')
+        .trim();
+      if (stripped) rawTitle = stripped;
+      rawTitle = rawTitle.slice(0, 140);
+    }
+
+    const channel = readFirstSelectorText([
+      'ytd-watch-metadata ytd-channel-name #text a',
+      'ytd-watch-metadata ytd-channel-name #text',
+      '#upload-info #channel-name a',
+      '#owner-name a',
+      '.up-detail-top .up-name',
+      '.up-name',
+      '[data-a-target="user-channel-header-item"] h1',
+      'a[data-a-target="StreamTitleChannelLink"]',
+      '[itemprop="author"] [itemprop="name"]',
+      'meta[name="author"]'
+    ], 60);
+
+    const tags = [];
+    const seenTags = new Set();
+    const pushTag = (rawTag) => {
+      if (tags.length >= 8) return;
+      const cleaned = cleanContextField(String(rawTag || '').replace(/^#+/, ''), 30);
+      if (!cleaned) return;
+      const lower = cleaned.toLowerCase();
+      if (seenTags.has(lower)) return;
+      seenTags.add(lower);
+      tags.push(cleaned);
+    };
+
+    if (typeof document.querySelectorAll === 'function') {
+      const tagSelectors = [
+        'ytd-watch-metadata a[href*="/hashtag/"]',
+        '#info a[href*="/hashtag/"]',
+        '.tag-area .tag-link',
+        'a[data-a-target="stream-game-link"]'
+      ];
+      for (let s = 0; s < tagSelectors.length && tags.length < 8; s++) {
+        let nodes = [];
+        try { nodes = document.querySelectorAll(tagSelectors[s]); } catch (e) { nodes = []; }
+        for (let i = 0; i < nodes.length && tags.length < 8; i++) {
+          if (!isInsideExtensionHost(nodes[i])) {
+            pushTag(nodes[i].textContent);
+          }
+        }
+      }
+    }
+
+    if (rawTitle && tags.length < 8) {
+      const hashRe = /#([^\s#.,!?;:()[\]{}"'<>【】「」『』]{1,28})/g;
+      let hm;
+      while ((hm = hashRe.exec(rawTitle)) !== null && tags.length < 8) {
+        pushTag(hm[1]);
+      }
+    }
+
+    let description = readFirstSelectorText([
+      'ytd-watch-metadata #description-inline-expander yt-attributed-string',
+      'ytd-watch-metadata #description-inline-expander',
+      '#description-inline-expander',
+      'ytd-watch-metadata #description',
+      '#description yt-attributed-string',
+      '#description .content',
+      '.desc-info-text',
+      '#v_desc .desc-info',
+      '.basic-desc-info',
+      '[data-a-target="stream-description"]',
+      '.about-section__panel--content',
+      'meta[name="description"]',
+      'meta[property="og:description"]',
+      'meta[name="twitter:description"]'
+    ], 360, cleanDescriptionField);
+
+    if (description && rawTitle && description.toLowerCase() === rawTitle.toLowerCase()) {
+      description = '';
+    }
+
+    return { title: rawTitle, channel, tags, description };
+  }
+
+  function getPageContext() {
+    return extractPageContext();
+  }
+
+  function doesKeywordMatchContext(keyword, haystack) {
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.doesKeywordMatchContext === 'function') {
+      return GLOSSARY_DB.doesKeywordMatchContext(keyword, haystack);
+    }
+    const kw = String(keyword || '').trim();
+    const text = String(haystack || '');
+    if (!kw || !text) return false;
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const startsAscii = /^[A-Za-z0-9]/.test(kw);
+    const endsAscii = /[A-Za-z0-9]$/.test(kw);
+    const prefix = startsAscii ? '(?:^|[^A-Za-z0-9])' : '';
+    const suffix = endsAscii ? '(?=$|[^A-Za-z0-9])' : '';
+    try {
+      return new RegExp(prefix + escaped + suffix, 'i').test(text);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function matchAutoPresetPackIds(pageCtx) {
+    const ctx = pageCtx || extractPageContext();
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.matchPageContext === 'function') {
+      return GLOSSARY_DB.matchPageContext(ctx).autoMatchedMacroIds;
+    }
+    return [];
+  }
+
+  function parseGlossaryEntries(rawInput) {
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.parseGlossaryEntries === 'function') {
+      return GLOSSARY_DB.parseGlossaryEntries(rawInput, 500);
+    }
+    let lines = [];
+    if (Array.isArray(rawInput)) {
+      lines = rawInput.map((x) => (x === null || x === undefined ? '' : String(x)));
+    } else if (typeof rawInput === 'string') {
+      lines = rawInput.replace(/\r\n?/g, '\n').split('\n');
+    } else {
+      return [];
+    }
+
+    const entries = [];
+    const seenKeys = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      if (entries.length >= 500) break;
+      const cleaned = lines[i]
+        .replace(/[\u200B-\u200D\uFEFF\x00-\x1F\x7F]/g, '')
+        .trim();
+      if (!cleaned || cleaned.startsWith('#') || cleaned.startsWith('//')) continue;
+
+      const eqMatch = cleaned.match(/[=＝]/);
+      if (eqMatch && typeof eqMatch.index === 'number') {
+        const src = cleaned.slice(0, eqMatch.index).trim().slice(0, 120);
+        const tgt = cleaned.slice(eqMatch.index + 1).trim().slice(0, 120);
+        if (!src) continue;
+        const normKey = src.toLowerCase();
+        if (seenKeys.has(normKey)) continue;
+        seenKeys.add(normKey);
+        if (tgt) {
+          entries.push({ type: 'pair', source: src, target: tgt, raw: `${src} = ${tgt}` });
+        } else {
+          entries.push({ type: 'noun', source: src, raw: src });
+        }
+      } else {
+        const noun = cleaned.slice(0, 120);
+        const normKey = noun.toLowerCase();
+        if (seenKeys.has(normKey)) continue;
+        seenKeys.add(normKey);
+        entries.push({ type: 'noun', source: noun, raw: noun });
+      }
+    }
+    return entries;
+  }
+
+  function parseImportedGlossaryText(rawContent, fileName) {
+    const text = String(rawContent || '').replace(/^\uFEFF/, '').trim();
+    const isJsonName = /\.json$/i.test(String(fileName || ''));
+    if (!text) {
+      return { entries: [], normalizedText: '', enabledPresetPacks: null };
+    }
+    if (isJsonName || text.startsWith('{') || text.startsWith('[')) {
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (err) {
+        throw new Error('JSON 词库文件格式无效，请检查语法');
+      }
+      const rawLines = [];
+      let importedPacks = null;
+      const collectFromArray = (arr) => {
+        for (let i = 0; i < arr.length; i++) {
+          const item = arr[i];
+          if (typeof item === 'string') {
+            rawLines.push(item);
+          } else if (isPlainObject(item)) {
+            const s = cleanContextField(item.source || item.term || item.orig || '', 120);
+            const t = cleanContextField(item.target || item.translation || item.trans || '', 120);
+            if (s && t) rawLines.push(`${s} = ${t}`);
+            else if (s) rawLines.push(s);
+          }
+        }
+      };
+      if (Array.isArray(parsed)) {
+        collectFromArray(parsed);
+      } else if (isPlainObject(parsed)) {
+        if (Array.isArray(parsed.enabledPresetPacks)) {
+          importedPacks = normalizePresetPackIds(parsed.enabledPresetPacks);
+        }
+        if (Array.isArray(parsed.customEntries)) {
+          collectFromArray(parsed.customEntries);
+        } else if (typeof parsed.customGlossary === 'string') {
+          rawLines.push(...parsed.customGlossary.split(/\r?\n/));
+        } else if (Array.isArray(parsed.customGlossary)) {
+          collectFromArray(parsed.customGlossary);
+        } else if (Array.isArray(parsed.entries)) {
+          collectFromArray(parsed.entries);
+        } else if (Array.isArray(parsed.packs)) {
+          for (let p = 0; p < parsed.packs.length; p++) {
+            if (parsed.packs[p] && Array.isArray(parsed.packs[p].entries)) {
+              collectFromArray(parsed.packs[p].entries);
+            }
+          }
+        } else {
+          throw new Error('未识别的 JSON 词库结构');
+        }
+      } else {
+        throw new Error('JSON 词库根节点须为对象或数组');
+      }
+      const entries = parseGlossaryEntries(rawLines);
+      return {
+        entries,
+        normalizedText: entries.map((e) => e.raw).join('\n'),
+        enabledPresetPacks: importedPacks
+      };
+    }
+
+    const entries = parseGlossaryEntries(text);
+    return {
+      entries,
+      normalizedText: entries.map((e) => e.raw).join('\n'),
+      enabledPresetPacks: null
+    };
+  }
+
+  function resolveTargetLanguageLabel(targetLang, bcpCode) {
+    const code = bcpCode || getBcp47LanguageCode(targetLang);
+    const map = {
+      'zh-Hans': 'Simplified Chinese (zh-Hans)',
+      'zh-Hant': 'Traditional Chinese (zh-Hant)',
+      en: 'English (en)',
+      ja: 'Japanese (ja)',
+      ko: 'Korean (ko)',
+      fr: 'French (fr)',
+      de: 'German (de)',
+      es: 'Spanish (es)',
+      ru: 'Russian (ru)'
+    };
+    return map[code] || `${cleanContextField(targetLang, 40) || code} (${code})`;
+  }
+
+  function formatConcisePageContextLines(ctx, maxChars) {
+    const limit = maxChars || MAX_SYSTEM_CONTEXT_CHARS;
+    const lines = [];
+    let used = 0;
+    const chan = ctx && ctx.channel ? cleanContextField(ctx.channel, 52) : '';
+    const title = ctx && ctx.title ? cleanContextField(ctx.title, 120) : '';
+    const tagsArr = (ctx && Array.isArray(ctx.tags)) ? ctx.tags.slice(0, 4) : [];
+    const desc = ctx && ctx.description ? cleanDescriptionField(ctx.description, 220) : '';
+
+    if (chan) {
+      lines.push(`Speaker / Channel: ${chan}`);
+      used += chan.length;
+    }
+    if (title) {
+      const allowTitle = Math.max(40, Math.min(120, limit - used));
+      const tVal = title.slice(0, allowTitle).trim();
+      if (tVal) {
+        lines.push(`Stream / Video Title: ${tVal}`);
+        used += tVal.length;
+      }
+    }
+    if (tagsArr.length > 0 && used < limit - 16) {
+      const tagStr = tagsArr.map((t) => '#' + t).join(', ').slice(0, Math.max(20, limit - used));
+      if (tagStr) {
+        lines.push(`Topic Tags: ${tagStr}`);
+        used += tagStr.length;
+      }
+    }
+    const remForDesc = limit - used;
+    if (desc && remForDesc >= 28 && (!title || desc.toLowerCase() !== title.toLowerCase())) {
+      let summary = desc.slice(0, remForDesc).trim();
+      if (desc.length > remForDesc) {
+        const lastSpace = summary.lastIndexOf(' ');
+        if (lastSpace > Math.floor(remForDesc * 0.6)) summary = summary.slice(0, lastSpace).trim();
+        summary = summary.replace(/[,:;.\-\s]+$/, '') + '…';
+      }
+      if (summary) {
+        lines.push(`Description: ${summary}`);
+      }
+    }
+    return lines;
+  }
+
+  function resolveEffectiveEnhancementState(cfgArg, pageCtxArg) {
+    const cfg = cfgArg || config;
+    const mode = getEffectiveTranslationMode(cfg);
+    const rawPageCtx = pageCtxArg || extractPageContext();
+    const usePageCtx = isAutoPageContextEnabled(cfg);
+    const useAutoPacks = isAutoPresetGlossaryEnabled(cfg);
+    const manualPackIds = getEnabledPresetPackIds(cfg);
+    const customEntries = parseGlossaryEntries(getCustomGlossaryRaw(cfg));
+
+    let dynamic = null;
+    if (GLOSSARY_DB && typeof GLOSSARY_DB.selectDynamicGlossary === 'function') {
+      dynamic = GLOSSARY_DB.selectDynamicGlossary({
+        pageCtx: rawPageCtx,
+        manualPackIds,
+        autoPresetGlossary: useAutoPacks,
+        customEntries,
+        maxPresetEntries: MAX_PRESET_GLOSSARY_INJECT
+      });
+    }
+
+    const matchedPackIds = dynamic ? dynamic.autoMatchedMacroIds : [];
+    const autoPackIds = dynamic ? dynamic.autoPackIds : [];
+    const activeMacroIds = dynamic ? dynamic.activeMacroIds : manualPackIds.slice();
+    const activePacks = BUILT_IN_GLOSSARY_PACKS.filter((p) => activeMacroIds.includes(p.id));
+    const matchedSubClusters = dynamic ? dynamic.matchedSubClusters : [];
+    const activeMatchedSubClusters = dynamic ? dynamic.activeMatchedSubClusters : [];
+    const selectedPresetEntries = dynamic ? dynamic.selectedPresetEntries : [];
+    const registerHints = dynamic ? dynamic.registerHints : [];
+    const injectedPresetCount = dynamic ? dynamic.injectedPresetCount : 0;
+
+    return {
+      mode,
+      rawPageCtx,
+      effectivePageCtx: usePageCtx ? rawPageCtx : { title: '', channel: '', tags: [], description: '' },
+      manualPackIds,
+      matchedPackIds,
+      autoPackIds,
+      matchedSubClusters,
+      activeMatchedSubClusters,
+      activePacks,
+      selectedPresetEntries,
+      registerHints,
+      injectedPresetCount,
+      customEntries
+    };
+  }
+
+  function buildNativeEnhancedSystemInstruction(cfgArg, pageCtxArg) {
+    const cfg = cfgArg || config;
+    if (getEffectiveTranslationMode(cfg) !== 'enhanced') return '';
+
+    const targetCode = getBcp47LanguageCode(cfg.targetLang);
+    const targetLabel = resolveTargetLanguageLabel(cfg.targetLang, targetCode);
+    const isChineseTarget = targetCode === 'zh-Hans' || targetCode === 'zh-Hant';
+    const state = resolveEffectiveEnhancementState(cfg, pageCtxArg);
+
+    const customKeySet = new Set(state.customEntries.map((e) => e.source.toLowerCase()));
+    const fixedPairs = [];
+    const properNouns = [];
+    const seenNouns = new Set();
+    const registerHints = isChineseTarget ? state.registerHints.slice() : [];
+    const domainSourceTerms = [];
+    const seenDomainTerms = new Set();
+
+    const addNoun = (n) => {
+      const k = n.toLowerCase();
+      if (!seenNouns.has(k)) {
+        seenNouns.add(k);
+        properNouns.push(n);
+      }
+    };
+
+    // Dynamically ranked Top-100 preset entries (already capped at MAX_PRESET_GLOSSARY_INJECT)
+    const presetEntries = state.selectedPresetEntries.slice(0, MAX_PRESET_GLOSSARY_INJECT);
+    for (let i = 0; i < presetEntries.length; i++) {
+      const entry = presetEntries[i];
+      if (customKeySet.has(entry.source.toLowerCase())) continue;
+      if (entry.type === 'noun') {
+        addNoun(entry.source);
+      } else if (isChineseTarget) {
+        fixedPairs.push(`${entry.source} = ${entry.target}`);
+      } else {
+        const dk = entry.source.toLowerCase();
+        if (!seenDomainTerms.has(dk)) {
+          seenDomainTerms.add(dk);
+          domainSourceTerms.push(entry.source);
+        }
+      }
+    }
+
+    // User's custom glossary entries always take top priority
+    for (let i = 0; i < state.customEntries.length; i++) {
+      const entry = state.customEntries[i];
+      if (entry.type === 'pair') {
+        fixedPairs.push(`${entry.source} = ${entry.target}`);
+      } else {
+        addNoun(entry.source);
+      }
+    }
+
+    const sections = [
+      `Translate all incoming spoken audio into ${targetLabel} for real-time simultaneous interpretation. Output only the natural translation of the spoken audio.`
+    ];
+
+    const ctxLines = formatConcisePageContextLines(state.effectivePageCtx, MAX_SYSTEM_CONTEXT_CHARS);
+    if (ctxLines.length > 0) {
+      sections.push(`Page Context (use solely to disambiguate homophones, names, and domain terms):\n${ctxLines.join('\n')}`);
+    }
+
+    if (registerHints.length > 0) {
+      let styleLine = `Translation Register: ${registerHints.join(' ')}`;
+      if (targetCode === 'zh-Hant') {
+        styleLine += ' Render Chinese output and glossary terms in Traditional Chinese script (zh-Hant).';
+      }
+      sections.push(styleLine);
+    } else if (targetCode === 'zh-Hant') {
+      sections.push('Render Chinese output and glossary terms in Traditional Chinese script (zh-Hant).');
+    }
+
+    if (domainSourceTerms.length > 0) {
+      sections.push(`Source Domain Terms (recognize accurately and translate naturally into ${targetLabel}): ${domainSourceTerms.join(', ')}`);
+    }
+
+    if (fixedPairs.length > 0) {
+      sections.push(`Fixed Glossary Rules (when the source term is spoken, use the specified target translation):\n${fixedPairs.join('\n')}`);
+    }
+
+    if (properNouns.length > 0) {
+      sections.push(`Untranslated Proper Nouns (keep unchanged as-is when spoken): ${properNouns.join(', ')}`);
+    }
+
+    return sections.join('\n\n');
+  }
+
+  function resolveInputTranscriptionForLang(sourceLangVal) {
+    const rawSrc = String(sourceLangVal || '').trim();
+    if (!rawSrc || /自动识别|auto/i.test(rawSrc)) return {};
+    const lowerSrc = rawSrc.toLowerCase();
+    if (lowerSrc.includes('日语') || lowerSrc.includes('日語') || lowerSrc.includes('japanese') || /^ja(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['ja-JP'] };
+    }
+    if (lowerSrc.includes('英语') || lowerSrc.includes('english') || /^en(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['en-US'] };
+    }
+    if (lowerSrc.includes('韩语') || lowerSrc.includes('韓語') || lowerSrc.includes('korean') || /^ko(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['ko-KR'] };
+    }
+    if (lowerSrc.includes('繁體') || lowerSrc.includes('繁体') || lowerSrc.includes('traditional') || lowerSrc.includes('zh-tw') || lowerSrc.includes('zh-hant')) {
+      return { languageCodes: ['zh-TW'] };
+    }
+    if (lowerSrc.includes('中文') || lowerSrc.includes('chinese') || /^zh(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['zh-CN'] };
+    }
+    if (lowerSrc.includes('法语') || lowerSrc.includes('法語') || lowerSrc.includes('french') || /^fr(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['fr-FR'] };
+    }
+    if (lowerSrc.includes('德语') || lowerSrc.includes('德語') || lowerSrc.includes('german') || /^de(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['de-DE'] };
+    }
+    if (lowerSrc.includes('西班牙') || lowerSrc.includes('spanish') || /^es(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['es-ES'] };
+    }
+    if (lowerSrc.includes('俄语') || lowerSrc.includes('俄語') || lowerSrc.includes('russian') || /^ru(?:\b|-)/.test(lowerSrc)) {
+      return { languageCodes: ['ru-RU'] };
+    }
+    return {};
+  }
+
+  function computeSetupSignatureForConfig(cfgArg, pageCtxArg) {
+    const cfg = cfgArg || config;
+    const model = normalizeModelName(cfg.model);
+    if (isLiveTranslateModel(model) && cfg.protocolMode === 'legacy') {
+      const srcHint = (cfg.sourceLang && !String(cfg.sourceLang).includes('自动识别')) ? String(cfg.sourceLang) : '';
+      return JSON.stringify({ mode: 'legacy', srcHint });
+    }
+    const sysText = buildNativeEnhancedSystemInstruction(cfg, pageCtxArg);
+    const inputTrans = resolveInputTranscriptionForLang(cfg.sourceLang);
+    return JSON.stringify({
+      mode: getEffectiveTranslationMode(cfg),
+      sysText,
+      inputTrans
+    });
+  }
 
   function buildDynamicSystemPrompt() {
     return '[CRITICAL DIRECTIVE]: You are a Real-Time Simultaneous Audio Interpreter. Output ONLY natural translations of the incoming speech in the target language.';
@@ -605,7 +1290,11 @@
     clock: '<svg class="g-sub-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 15.5 14"></polyline></svg>',
     warn: '<svg class="g-sub-svg" viewBox="0 0 24 24"><path d="m10.3 3.9-8.1 14a2 2 0 0 0 1.7 3h16.2a2 2 0 0 0 1.7-3l-8.1-14a2 2 0 0 0-3.4 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>',
     error: '<svg class="g-sub-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="m15 9-6 6M9 9l6 6"></path></svg>',
-    idle: '<svg class="g-sub-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"></circle></svg>'
+    idle: '<svg class="g-sub-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"></circle></svg>',
+    standardMode: '<svg class="g-sub-svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M8 12h8"></path></svg>',
+    enhancedMode: '<svg class="g-sub-svg" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"></path><path d="M19 16l.9 2.1L22 19l-2.1.9L19 22l-.9-2.1L16 19l2.1-.9L19 16z"></path></svg>',
+    upload: '<svg class="g-sub-svg" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>',
+    download: '<svg class="g-sub-svg" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>'
   };
 
   let hostEl = null;
@@ -625,6 +1314,21 @@
   let btnAudioMode = null;
   let btnSettings = null;
   let settingsPanel = null;
+  let modeBadgeEl = null;
+  let btnModeStandard = null;
+  let btnModeEnhanced = null;
+  let enhancedBoxEl = null;
+  let btnAutoContext = null;
+  let btnAutoPack = null;
+  let contextPreviewEl = null;
+  let presetPackButtons = [];
+  let customCountEl = null;
+  let customGlossaryTextarea = null;
+  let btnGlossaryImport = null;
+  let btnGlossaryExportTxt = null;
+  let btnGlossaryExportJson = null;
+  let glossaryFileInput = null;
+  let glossaryHintEl = null;
   let opacitySlider = null;
   let opacityVal = null;
   let blurSlider = null;
@@ -690,6 +1394,7 @@
       btnSettings.setAttribute('aria-expanded', nextOpen ? 'true' : 'false');
     }
     if (nextOpen) {
+      refreshOverlayEnhancedUI();
       updateSettingsPanelBounds();
     } else {
       for (let i = 0; i < customDropdowns.length; i++) {
@@ -1154,6 +1859,42 @@
 
       <div class="g-sub-settings-panel" id="gSubSettingsPanel" role="region" aria-label="外观与快捷操作">
         <div class="g-sub-setting-row">
+          <div class="g-sub-setting-label">
+            <span>同传模式</span>
+            <span class="g-sub-mode-badge" id="gSubModeBadge">纯净基线</span>
+          </div>
+          <div class="g-sub-seg-group" role="group" aria-label="同传模式选择">
+            <button type="button" class="g-sub-seg-btn active" id="gSubModeStandard" title="不注入任何特定语境与术语表" aria-label="标准模式" aria-pressed="true">${UI_ICONS.standardMode}<span>标准模式</span></button>
+            <button type="button" class="g-sub-seg-btn" id="gSubModeEnhanced" title="在握手阶段注入网页语境与所选术语表" aria-label="语境与术语增强" aria-pressed="false">${UI_ICONS.enhancedMode}<span>语境与术语增强</span></button>
+          </div>
+        </div>
+
+        <div class="g-sub-enhanced-box" id="gSubEnhancedBox">
+          <div class="g-sub-toggle-grid">
+            <button type="button" class="g-sub-toggle-chip active" id="gSubAutoContextBtn" title="自动提取当前视频标题、频道与简介辅助消歧" aria-label="自动网页语境" aria-pressed="true">${UI_ICONS.check}<span>自动网页语境</span></button>
+            <button type="button" class="g-sub-toggle-chip" id="gSubAutoPackBtn" title="按标题、频道、标签与简介动态匹配 60 个细分领域并精选 Top-100 词条" aria-label="关键词自动词库" aria-pressed="false">${UI_ICONS.check}<span>关键词自动词库</span></button>
+          </div>
+          <div class="g-sub-ctx-preview" id="gSubContextPreview">网页语境：待检测当前页面标题、频道与简介信息</div>
+          <div class="g-sub-setting-row">
+            <div class="g-sub-setting-label"><span>内置预设词库包（动态精选 Top-100）</span><span></span></div>
+            <div class="g-sub-pack-grid" id="gSubPresetPackGrid">
+              ${BUILT_IN_GLOSSARY_PACKS.map((pk) => `<button type="button" class="g-sub-pack-chip" id="gSubPack_${pk.id}" data-pack="${pk.id}" title="${escapeHtml(pk.name + (pk.entryCount ? '（' + pk.entryCount + '词条/' + pk.subClusterCount + '子领域）' : '') + '：' + pk.description)}" aria-label="${escapeHtml(pk.name)}" aria-pressed="false"><span>${escapeHtml(pk.shortName)}</span>${UI_ICONS.check}</button>`).join('')}
+            </div>
+          </div>
+          <div class="g-sub-setting-row">
+            <div class="g-sub-setting-label"><span>自定义术语表</span><span id="gSubCustomCount">0 条</span></div>
+            <textarea class="g-sub-glossary-textarea" id="gSubCustomInput" rows="3" spellcheck="false" placeholder="每行一条：原词 = 指定译法，或单独填写保留专有名词" aria-label="自定义术语表"></textarea>
+            <div class="g-sub-glossary-tools">
+              <button type="button" class="g-sub-mini-btn" id="gSubGlossaryImport" title="导入 TXT 或 JSON 词库" aria-label="导入词库">${UI_ICONS.upload}<span>导入</span></button>
+              <button type="button" class="g-sub-mini-btn" id="gSubGlossaryExportTxt" title="导出 TXT 词库" aria-label="导出 TXT 词库">${UI_ICONS.download}<span>导出TXT</span></button>
+              <button type="button" class="g-sub-mini-btn" id="gSubGlossaryExportJson" title="导出 JSON 词库" aria-label="导出 JSON 词库">${UI_ICONS.download}<span>导出JSON</span></button>
+            </div>
+            <input type="file" id="gSubGlossaryFile" accept=".txt,.json,application/json,text/plain" style="display: none;" aria-label="选择词库文件">
+            <div class="g-sub-glossary-hint" id="gSubGlossaryHint" aria-live="polite"></div>
+          </div>
+        </div>
+
+        <div class="g-sub-setting-row">
           <div class="g-sub-setting-label"><span>窗口不透明度</span><span id="gSubOpacityVal">65%</span></div>
           <input type="range" id="gSubOpacitySlider" min="10" max="100" value="65" class="g-sub-setting-slider" aria-label="窗口不透明度">
         </div>
@@ -1217,6 +1958,23 @@
     btnAudioMode = overlay.querySelector('#gSubAudioMode');
     btnSettings = overlay.querySelector('#gSubSettingsBtn');
     settingsPanel = overlay.querySelector('#gSubSettingsPanel');
+    modeBadgeEl = overlay.querySelector('#gSubModeBadge');
+    btnModeStandard = overlay.querySelector('#gSubModeStandard');
+    btnModeEnhanced = overlay.querySelector('#gSubModeEnhanced');
+    enhancedBoxEl = overlay.querySelector('#gSubEnhancedBox');
+    btnAutoContext = overlay.querySelector('#gSubAutoContextBtn');
+    btnAutoPack = overlay.querySelector('#gSubAutoPackBtn');
+    contextPreviewEl = overlay.querySelector('#gSubContextPreview');
+    presetPackButtons = BUILT_IN_GLOSSARY_PACKS
+      .map((pk) => overlay.querySelector('#gSubPack_' + pk.id))
+      .filter(Boolean);
+    customCountEl = overlay.querySelector('#gSubCustomCount');
+    customGlossaryTextarea = overlay.querySelector('#gSubCustomInput');
+    btnGlossaryImport = overlay.querySelector('#gSubGlossaryImport');
+    btnGlossaryExportTxt = overlay.querySelector('#gSubGlossaryExportTxt');
+    btnGlossaryExportJson = overlay.querySelector('#gSubGlossaryExportJson');
+    glossaryFileInput = overlay.querySelector('#gSubGlossaryFile');
+    glossaryHintEl = overlay.querySelector('#gSubGlossaryHint');
     opacitySlider = overlay.querySelector('#gSubOpacitySlider');
     opacityVal = overlay.querySelector('#gSubOpacityVal');
     blurSlider = overlay.querySelector('#gSubBlurSlider');
@@ -1234,9 +1992,9 @@
     enhanceCustomSelect(tgtLangSelect);
     enhanceCustomSelect(displayModeSelect, { block: true, dropUp: true });
 
-    // 阻断浮窗内部的键盘事件冒泡到宿主页面（防止调节控件时误触 YouTube/B站 空格暂停、方向键快进或全屏快捷键）
+    // 阻断浮窗内部的键盘事件冒泡到宿主页面（防止调节控件或编辑词库时误触 YouTube/B站 空格暂停、方向键快进或全屏快捷键）
     overlay.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229) {
         const hadOpenDropdown = customDropdowns.some((dd) => dd && dd.classList.contains('open'));
         closeAllCustomDropdowns(null, hadOpenDropdown);
         if (!hadOpenDropdown && settingsPanel && settingsPanel.classList.contains('show')) {
@@ -1245,6 +2003,7 @@
       }
       e.stopPropagation();
     });
+    overlay.addEventListener('keypress', (e) => e.stopPropagation());
     overlay.addEventListener('keyup', (e) => e.stopPropagation());
   }
 
@@ -1607,6 +2366,10 @@
             updateSettingsPanelBounds();
           }
           repositionOpenCustomDropdowns();
+          if (!isUserScrolledUp) {
+            syncPinnedScrollBaseline();
+            safeScrollToBottom();
+          }
         }
         if (!overlay || overlay.style.display === 'none' || isDragging || isSyncingOverlayStyle) return;
         if (resizePersistTimer) clearTimeout(resizePersistTimer);
@@ -1616,6 +2379,101 @@
         }, 220);
       });
       overlayResizeObserver.observe(overlay);
+    }
+  }
+
+  function refreshOverlayEnhancedUI() {
+    if (!isTopFrame || !overlay) return;
+    const state = resolveEffectiveEnhancementState(config);
+    const isEnh = state.mode === 'enhanced';
+
+    if (btnSettings) {
+      btnSettings.classList.toggle('enhanced-active', isEnh);
+    }
+    if (modeBadgeEl) {
+      modeBadgeEl.textContent = isEnh ? '语境增强' : '纯净基线';
+      modeBadgeEl.classList.toggle('enhanced', isEnh);
+    }
+    if (btnModeStandard) {
+      btnModeStandard.classList.toggle('active', !isEnh);
+      btnModeStandard.setAttribute('aria-pressed', !isEnh ? 'true' : 'false');
+    }
+    if (btnModeEnhanced) {
+      btnModeEnhanced.classList.toggle('active', isEnh);
+      btnModeEnhanced.setAttribute('aria-pressed', isEnh ? 'true' : 'false');
+    }
+    if (enhancedBoxEl) {
+      enhancedBoxEl.classList.toggle('show', isEnh);
+    }
+
+    const autoCtxOn = isAutoPageContextEnabled(config);
+    const autoPackOn = isAutoPresetGlossaryEnabled(config);
+    if (btnAutoContext) {
+      btnAutoContext.classList.toggle('active', autoCtxOn);
+      btnAutoContext.setAttribute('aria-pressed', autoCtxOn ? 'true' : 'false');
+    }
+    if (btnAutoPack) {
+      btnAutoPack.classList.toggle('active', autoPackOn);
+      btnAutoPack.setAttribute('aria-pressed', autoPackOn ? 'true' : 'false');
+    }
+
+    if (contextPreviewEl) {
+      const injectedPreset = state.injectedPresetCount || 0;
+      const customCnt = state.customEntries.length;
+      const injectedSummary = (injectedPreset > 0 || customCnt > 0)
+        ? `已注入 ${injectedPreset} 条预设${customCnt > 0 ? ` + ${customCnt} 条自定义` : ''}词条`
+        : '';
+      if (!autoCtxOn && !autoPackOn) {
+        contextPreviewEl.textContent = injectedSummary
+          ? `网页语境：已关闭自动提取 · ${injectedSummary}`
+          : '网页语境：已关闭自动提取，仅注入下方勾选与自定义词库';
+      } else {
+        const parts = [];
+        if (autoCtxOn) {
+          if (state.rawPageCtx.channel) parts.push(`频道：${state.rawPageCtx.channel}`);
+          if (state.rawPageCtx.title) parts.push(`标题：${state.rawPageCtx.title}`);
+          if (state.rawPageCtx.tags && state.rawPageCtx.tags.length > 0) {
+            parts.push(`标签：#${state.rawPageCtx.tags.slice(0, 4).join(' #')}`);
+          }
+        }
+        const subSource = (state.activeMatchedSubClusters && state.activeMatchedSubClusters.length > 0)
+          ? state.activeMatchedSubClusters
+          : (autoPackOn ? state.matchedSubClusters : []);
+        if (subSource && subSource.length > 0) {
+          const subNames = subSource.slice(0, 2).map((s) => s.name);
+          parts.push(`命中子领域：${subNames.join('、')}`);
+        } else if (autoPackOn && state.autoPackIds.length > 0) {
+          const autoNames = BUILT_IN_GLOSSARY_PACKS
+            .filter((p) => state.autoPackIds.includes(p.id))
+            .map((p) => p.shortName);
+          if (autoNames.length > 0) parts.push(`自动命中：${autoNames.join('、')}`);
+        }
+        if (injectedSummary) parts.push(injectedSummary);
+        contextPreviewEl.textContent = parts.length > 0
+          ? parts.join(' · ')
+          : '网页语境：当前页面暂无可提取标题、频道或简介信息';
+      }
+    }
+
+    for (let i = 0; i < presetPackButtons.length; i++) {
+      const btn = presetPackButtons[i];
+      const pid = (btn.dataset && btn.dataset.pack) || (typeof btn.getAttribute === 'function' ? btn.getAttribute('data-pack') : '');
+      const isManual = state.manualPackIds.includes(pid);
+      const isAuto = state.autoPackIds.includes(pid);
+      btn.classList.toggle('active', isManual);
+      btn.classList.toggle('auto-hit', isAuto && !isManual);
+      btn.setAttribute('aria-pressed', isManual ? 'true' : 'false');
+    }
+
+    if (customCountEl) {
+      customCountEl.textContent = `${state.customEntries.length} 条`;
+    }
+    const activeShadowEl = (shadowRoot && shadowRoot.activeElement) ? shadowRoot.activeElement : null;
+    if (customGlossaryTextarea && activeShadowEl !== customGlossaryTextarea) {
+      const rawGloss = getCustomGlossaryRaw(config);
+      if (customGlossaryTextarea.value !== rawGloss) {
+        customGlossaryTextarea.value = rawGloss;
+      }
     }
   }
 
@@ -1657,6 +2515,7 @@
     if (blurVal) blurVal.textContent = `${config.blur}px`;
     if (fontSizeSlider) fontSizeSlider.value = config.fontSize;
     if (fontSizeVal) fontSizeVal.textContent = `${config.fontSize}px`;
+    refreshOverlayEnhancedUI();
     syncAllCustomSelects();
     applyDisplayMode();
   }
@@ -1667,6 +2526,10 @@
     overlay.dataset.displayMode = mode;
     const entries = subBody.querySelectorAll('.g-sub-entry');
     entries.forEach((entry) => applyDisplayModeToEntry(entry));
+    if (!isUserScrolledUp) {
+      markProgrammaticScroll();
+      syncPinnedScrollBaseline();
+    }
     safeScrollToBottom();
   }
 
@@ -1959,6 +2822,7 @@
       next.responseModality !== previous.responseModality
     );
 
+    const prevSetupSig = isRunning ? computeSetupSignatureForConfig(previous) : '';
     config = next;
     if (!String(config.sourceLang || '').includes('自动识别')) {
       resetDetectedSourceLangBadge();
@@ -1966,7 +2830,11 @@
     }
     applyInitialStyles();
     updateAudioModeButton();
-    if (needsRestart) manualRestart('配置更新');
+    if (needsRestart) {
+      manualRestart('配置更新');
+    } else if (isRunning && nextIsNativeLive && computeSetupSignatureForConfig(config) !== prevSetupSig) {
+      triggerSeamlessSetupRotation('config-context-update');
+    }
   }
 
   // ---- 滚动 ------------------------------------------------------------
@@ -1976,6 +2844,22 @@
   let viewportRafId = null;
   let isScrollPending = false;
   let isProgrammaticScrolling = false;
+  let lastKnownScrollTop = 0;
+  let maxPinnedScrollTop = 0;
+  let hasPinnedScrollBaseline = false;
+  let wheelDownProjectedTop = 0;
+  let lastWheelDownAt = 0;
+
+  function syncPinnedScrollBaseline() {
+    if (!subBody) return;
+    const maxTop = subBody.clientHeight > 0
+      ? Math.max(0, subBody.scrollHeight - subBody.clientHeight)
+      : subBody.scrollTop;
+    const effTop = Math.min(subBody.scrollTop, maxTop);
+    lastKnownScrollTop = effTop;
+    hasPinnedScrollBaseline = maxTop > 0 || effTop > 0;
+    maxPinnedScrollTop = effTop;
+  }
 
   function cancelPendingScroll() {
     if (scrollRafId !== null) {
@@ -1988,6 +2872,25 @@
       scrollResetRafId = null;
       isProgrammaticScrolling = false;
     }
+  }
+
+  function markProgrammaticScroll() {
+    isProgrammaticScrolling = true;
+    if (scrollResetRafId !== null) {
+      cancelAnimationFrame(scrollResetRafId);
+      scrollResetRafId = null;
+    }
+    scrollResetRafId = requestAnimationFrame(() => {
+      scrollResetRafId = null;
+      isProgrammaticScrolling = false;
+      if (subBody && !isUserScrolledUp) {
+        const dist = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
+        if (dist > 2) {
+          subBody.scrollTop = subBody.scrollHeight;
+        }
+        syncPinnedScrollBaseline();
+      }
+    });
   }
 
   function scheduleEnsureOverlayInViewport() {
@@ -2008,44 +2911,91 @@
   if (isTopFrame) {
     subBody.addEventListener('wheel', (e) => {
       if (e.deltaY < 0) {
+        wheelDownProjectedTop = 0;
+        lastWheelDownAt = 0;
         const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
         if (distanceFromBottom > 60) {
           isUserScrolledUp = true;
           scrollBottomBtn.style.display = 'inline-flex';
           cancelPendingScroll();
+        } else if (e.deltaY < -4 && subBody.scrollTop > 0) {
+          cancelPendingScroll();
         }
       } else if (e.deltaY > 0) {
-        const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
-        if (distanceFromBottom <= 30) {
+        const tWheel = now();
+        const curTop = subBody.scrollTop;
+        const maxTop = Math.max(0, subBody.scrollHeight - subBody.clientHeight);
+        const baseTop = (lastWheelDownAt > 0 && (tWheel - lastWheelDownAt) <= 320)
+          ? Math.max(curTop, wheelDownProjectedTop)
+          : curTop;
+        wheelDownProjectedTop = Math.min(maxTop, baseTop + e.deltaY);
+        lastWheelDownAt = tWheel;
+        const distanceFromBottom = subBody.scrollHeight - curTop - subBody.clientHeight;
+        if (distanceFromBottom <= 30 || maxTop - wheelDownProjectedTop <= 16) {
+          wheelDownProjectedTop = 0;
+          lastWheelDownAt = 0;
           isUserScrolledUp = false;
           scrollBottomBtn.style.display = 'none';
+          safeScrollToBottom();
         }
       }
     }, { passive: true });
 
     subBody.addEventListener('scroll', () => {
-      if (isProgrammaticScrolling) return;
-      const distanceFromBottom = subBody.scrollHeight - subBody.scrollTop - subBody.clientHeight;
-      if (distanceFromBottom <= 30) {
+      const curTop = subBody.scrollTop;
+      const prevTop = lastKnownScrollTop;
+      const hadBaseline = hasPinnedScrollBaseline;
+      lastKnownScrollTop = curTop;
+      if (!isUserScrolledUp && curTop > maxPinnedScrollTop) {
+        maxPinnedScrollTop = curTop;
+        if (curTop > 0) hasPinnedScrollBaseline = true;
+      }
+      const distanceFromBottom = subBody.scrollHeight - curTop - subBody.clientHeight;
+      if (distanceFromBottom <= 36) {
+        const wasScrolledUp = isUserScrolledUp;
+        wheelDownProjectedTop = 0;
+        lastWheelDownAt = 0;
         isUserScrolledUp = false;
         scrollBottomBtn.style.display = 'none';
-      } else if (distanceFromBottom > 60) {
+        const maxTop = subBody.clientHeight > 0
+          ? Math.max(0, subBody.scrollHeight - subBody.clientHeight)
+          : curTop;
+        hasPinnedScrollBaseline = maxTop > 0 || curTop > 0;
+        maxPinnedScrollTop = Math.max(curTop, maxTop);
+        if (wasScrolledUp && distanceFromBottom > 1) {
+          safeScrollToBottom();
+        }
+        return;
+      }
+      // 仅当 scrollTop 真实向上回退（严格小于上一位置，排除布局钳制与零位移事件，兼容小溢出滑块拖动并免疫动画微抖）且距底超阈值时才认定为用户上滚
+      const settleTolerance = Math.min(6, Math.max(0, maxPinnedScrollTop * 0.4));
+      if (isProgrammaticScrolling && !(hadBaseline && curTop < prevTop - 4 && curTop < maxPinnedScrollTop - settleTolerance)) return;
+      const movedUpFromPinned = !hadBaseline
+        ? !isScrollPending
+        : (curTop < prevTop - 0.5 && (curTop < maxPinnedScrollTop - settleTolerance || (curTop === 0 && prevTop > 2)));
+      if (distanceFromBottom > 60 && movedUpFromPinned) {
+        wheelDownProjectedTop = 0;
+        lastWheelDownAt = 0;
         isUserScrolledUp = true;
         scrollBottomBtn.style.display = 'inline-flex';
+        cancelPendingScroll();
       }
     });
 
     scrollBottomBtn.addEventListener('click', () => {
+      wheelDownProjectedTop = 0;
+      lastWheelDownAt = 0;
       cancelPendingScroll();
       isUserScrolledUp = false;
       scrollBottomBtn.style.display = 'none';
-      isProgrammaticScrolling = true;
+      markProgrammaticScroll();
+      pruneOldSubtitleEntries();
+      if (typeof subBody.scrollTo === 'function') {
+        try { subBody.scrollTo({ top: subBody.scrollHeight, behavior: 'instant' }); } catch (e) {}
+      }
       subBody.scrollTop = subBody.scrollHeight;
-      if (scrollResetRafId !== null) cancelAnimationFrame(scrollResetRafId);
-      scrollResetRafId = requestAnimationFrame(() => {
-        scrollResetRafId = null;
-        isProgrammaticScrolling = false;
-      });
+      syncPinnedScrollBaseline();
+      safeScrollToBottom();
     });
   }
 
@@ -2056,13 +3006,15 @@
       isScrollPending = false;
       scrollRafId = null;
       if (!isUserScrolledUp && subBody) {
-        isProgrammaticScrolling = true;
+        const beforeTop = subBody.scrollTop;
+        const targetMax = subBody.clientHeight > 0
+          ? Math.max(0, subBody.scrollHeight - subBody.clientHeight)
+          : subBody.scrollHeight;
+        if (beforeTop < targetMax) {
+          markProgrammaticScroll();
+        }
         subBody.scrollTop = subBody.scrollHeight;
-        if (scrollResetRafId !== null) cancelAnimationFrame(scrollResetRafId);
-        scrollResetRafId = requestAnimationFrame(() => {
-          scrollResetRafId = null;
-          isProgrammaticScrolling = false;
-        });
+        syncPinnedScrollBaseline();
       }
     });
   }
@@ -2122,14 +3074,19 @@
 
     srcLangSelect.addEventListener('change', () => {
       if (!checkExtensionContextHealth()) return;
+      const prevSig = isRunning ? computeSetupSignatureForConfig(config) : '';
       config.sourceLang = srcLangSelect.value;
       if (!String(config.sourceLang || '').includes('自动识别')) {
         resetDetectedSourceLangBadge();
         setDiagnostics({ SrcLang: config.sourceLang });
       }
       saveConfig(true, ['sourceLang']);
-      if (isRunning && !(isLiveTranslateModel(normalizeModelName(config.model)) && config.protocolMode !== 'legacy')) {
-        manualRestart('切换源语言');
+      if (isRunning) {
+        if (!(isLiveTranslateModel(normalizeModelName(config.model)) && config.protocolMode !== 'legacy')) {
+          manualRestart('切换源语言');
+        } else if (computeSetupSignatureForConfig(config) !== prevSig) {
+          triggerSeamlessSetupRotation('source-lang-change');
+        }
       }
     });
 
@@ -2184,6 +3141,11 @@
       config.fontSize = parseInt(fontSizeSlider.value, 10);
       fontSizeVal.textContent = `${config.fontSize}px`;
       overlay.style.setProperty('--g-sub-font-size', `${config.fontSize}px`);
+      if (!isUserScrolledUp) {
+        markProgrammaticScroll();
+        syncPinnedScrollBaseline();
+        safeScrollToBottom();
+      }
       saveConfig(false, ['fontSize']);
     });
     displayModeSelect.addEventListener('change', () => {
@@ -2192,6 +3154,189 @@
       applyDisplayMode();
       saveConfig(true, ['displayMode']);
     });
+
+    function showOverlayGlossaryHint(text, isErr = false) {
+      if (!glossaryHintEl) return;
+      glossaryHintEl.textContent = text || '';
+      glossaryHintEl.style.color = isErr ? '#f87171' : '#34d399';
+    }
+
+    function applyOverlayEnhancementChange(changedKeys, reason, immediateSave = true) {
+      refreshOverlayEnhancedUI();
+      if (settingsPanel && settingsPanel.classList.contains('show')) {
+        updateSettingsPanelBounds();
+      }
+      saveConfig(immediateSave, changedKeys);
+      if (isRunning && isLiveTranslateModel(normalizeModelName(config.model)) && config.protocolMode !== 'legacy') {
+        triggerSeamlessSetupRotation(reason);
+      }
+    }
+
+    if (btnModeStandard) {
+      btnModeStandard.addEventListener('click', () => {
+        if (!checkExtensionContextHealth()) return;
+        if (getEffectiveTranslationMode(config) === 'standard' && config.translationMode === 'standard') return;
+        config.translationMode = 'standard';
+        applyOverlayEnhancementChange(['translationMode'], 'switch-mode-standard', true);
+      });
+    }
+
+    if (btnModeEnhanced) {
+      btnModeEnhanced.addEventListener('click', () => {
+        if (!checkExtensionContextHealth()) return;
+        if (getEffectiveTranslationMode(config) === 'enhanced') return;
+        config.translationMode = 'enhanced';
+        applyOverlayEnhancementChange(['translationMode'], 'switch-mode-enhanced', true);
+      });
+    }
+
+    if (btnAutoContext) {
+      btnAutoContext.addEventListener('click', () => {
+        if (!checkExtensionContextHealth()) return;
+        config.autoPageContext = !isAutoPageContextEnabled(config);
+        applyOverlayEnhancementChange(['autoPageContext'], 'toggle-auto-context', true);
+      });
+    }
+
+    if (btnAutoPack) {
+      btnAutoPack.addEventListener('click', () => {
+        if (!checkExtensionContextHealth()) return;
+        config.autoPresetGlossary = !isAutoPresetGlossaryEnabled(config);
+        applyOverlayEnhancementChange(['autoPresetGlossary'], 'toggle-auto-pack', true);
+      });
+    }
+
+    for (let i = 0; i < presetPackButtons.length; i++) {
+      const packBtn = presetPackButtons[i];
+      packBtn.addEventListener('click', () => {
+        if (!checkExtensionContextHealth()) return;
+        const pid = (packBtn.dataset && packBtn.dataset.pack) || (typeof packBtn.getAttribute === 'function' ? packBtn.getAttribute('data-pack') : '');
+        if (!pid) return;
+        const curPacks = getEnabledPresetPackIds(config);
+        const idx = curPacks.indexOf(pid);
+        if (idx === -1) curPacks.push(pid);
+        else curPacks.splice(idx, 1);
+        config.enabledPresetPacks = curPacks;
+        applyOverlayEnhancementChange(['enabledPresetPacks'], 'toggle-preset-pack', true);
+      });
+    }
+
+    if (customGlossaryTextarea) {
+      const flushCustomGlossaryEdit = (immediate) => {
+        if (!checkExtensionContextHealth()) return;
+        const sanitizedCfg = sanitizeConfigObject({ customGlossary: customGlossaryTextarea.value });
+        config.customGlossary = sanitizedCfg.customGlossary || '';
+        const parsedCount = parseGlossaryEntries(config.customGlossary).length;
+        if (customCountEl) customCountEl.textContent = `${parsedCount} 条`;
+        saveConfig(immediate, ['customGlossary']);
+        if (customGlossaryRotateTimer) {
+          clearTimeout(customGlossaryRotateTimer);
+          customGlossaryRotateTimer = null;
+        }
+        if (isRunning && getEffectiveTranslationMode(config) === 'enhanced' && isLiveTranslateModel(normalizeModelName(config.model)) && config.protocolMode !== 'legacy') {
+          if (immediate) {
+            triggerSeamlessSetupRotation('custom-glossary-edit');
+          } else {
+            customGlossaryRotateTimer = setTimeout(() => {
+              customGlossaryRotateTimer = null;
+              if (!isDestroyed && isRunning && getEffectiveTranslationMode(config) === 'enhanced') {
+                triggerSeamlessSetupRotation('custom-glossary-edit');
+              }
+            }, 550);
+          }
+        }
+      };
+
+      customGlossaryTextarea.addEventListener('input', () => flushCustomGlossaryEdit(false));
+      customGlossaryTextarea.addEventListener('change', () => flushCustomGlossaryEdit(true));
+      customGlossaryTextarea.addEventListener('blur', () => flushCustomGlossaryEdit(true));
+    }
+
+    function triggerOverlayGlossaryDownload(content, filename, mimeType) {
+      try {
+        if (typeof Blob === 'function' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+          const blob = new Blob([content], { type: mimeType });
+          const dlUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = dlUrl;
+          a.download = filename;
+          a.style.display = 'none';
+          if (document.body) document.body.appendChild(a);
+          a.click();
+          if (a.parentNode) a.remove();
+          setTimeout(() => {
+            try { URL.revokeObjectURL(dlUrl); } catch (e) {}
+          }, 1000);
+          return true;
+        }
+      } catch (e) {}
+      return false;
+    }
+
+    if (btnGlossaryExportTxt) {
+      btnGlossaryExportTxt.addEventListener('click', () => {
+        const entries = parseGlossaryEntries(getCustomGlossaryRaw(config));
+        const txt = entries.map((e) => e.raw).join('\n');
+        if (!txt) {
+          showOverlayGlossaryHint('当前自定义术语表为空', true);
+          return;
+        }
+        const ok = triggerOverlayGlossaryDownload(txt + '\n', 'gemini-live-glossary.txt', 'text/plain;charset=utf-8');
+        showOverlayGlossaryHint(ok ? `已导出 ${entries.length} 条术语 (TXT)` : '导出失败', !ok);
+      });
+    }
+
+    if (btnGlossaryExportJson) {
+      btnGlossaryExportJson.addEventListener('click', () => {
+        const entries = parseGlossaryEntries(getCustomGlossaryRaw(config));
+        const payloadObj = {
+          schema: 'gemini-live-translator-glossary-v1',
+          exportedAt: new Date(now()).toISOString(),
+          enabledPresetPacks: getEnabledPresetPackIds(config),
+          customEntries: entries.map((e) => e.raw)
+        };
+        const ok = triggerOverlayGlossaryDownload(JSON.stringify(payloadObj, null, 2), 'gemini-live-glossary.json', 'application/json;charset=utf-8');
+        showOverlayGlossaryHint(ok ? `已导出词库配置 (${entries.length} 条自定义)` : '导出失败', !ok);
+      });
+    }
+
+    if (btnGlossaryImport && glossaryFileInput) {
+      btnGlossaryImport.addEventListener('click', () => {
+        glossaryFileInput.value = '';
+        glossaryFileInput.click();
+      });
+      glossaryFileInput.addEventListener('change', async () => {
+        if (!checkExtensionContextHealth()) return;
+        const file = glossaryFileInput.files && glossaryFileInput.files[0];
+        if (!file) return;
+        if (file.size > 512 * 1024) {
+          showOverlayGlossaryHint('词库文件超过 512KB 上限', true);
+          return;
+        }
+        try {
+          const rawText = typeof file.text === 'function'
+            ? await file.text()
+            : await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result || ''));
+              reader.onerror = () => reject(new Error('读取文件失败'));
+              reader.readAsText(file, 'utf-8');
+            });
+          const imported = parseImportedGlossaryText(rawText, file.name);
+          config.customGlossary = imported.normalizedText;
+          const touched = ['customGlossary'];
+          if (Array.isArray(imported.enabledPresetPacks)) {
+            config.enabledPresetPacks = imported.enabledPresetPacks;
+            touched.push('enabledPresetPacks');
+          }
+          if (customGlossaryTextarea) customGlossaryTextarea.value = config.customGlossary;
+          applyOverlayEnhancementChange(touched, 'import-glossary', true);
+          showOverlayGlossaryHint(`已导入 ${imported.entries.length} 条术语`, false);
+        } catch (err) {
+          showOverlayGlossaryHint(sanitizeErrorMessage(err && err.message ? err.message : err), true);
+        }
+      });
+    }
 
     if (btnCopyAll) {
       let copyBtnTimer = null;
@@ -2287,6 +3432,7 @@
 
   function ensureOverlayMounted() {
     if (!isTopFrame || isDestroyed || !hostEl) return;
+    ensureDynamicTitleObserver();
     const fsElement = getFullscreenElement();
     if (fsElement) {
       if (!isNonContainerFullscreen(fsElement)) {
@@ -2447,7 +3593,13 @@
     committedLines = 0;
     resetDetectedSourceLangBadge();
     setDiagnostics({ Lines: 0 });
+    markProgrammaticScroll();
     subBody.scrollTop = 0;
+    lastKnownScrollTop = 0;
+    maxPinnedScrollTop = 0;
+    hasPinnedScrollBaseline = false;
+    wheelDownProjectedTop = 0;
+    lastWheelDownAt = 0;
   }
 
   function ensureStreamingEntry() {
@@ -2518,13 +3670,25 @@
 
   function pruneOldSubtitleEntries() {
     const limit = isUserScrolledUp ? SUBTITLE_SCROLLED_UP_CAP : SUBTITLE_MAX_HISTORY;
+    let removedAny = false;
     while (subBody.children.length > limit) {
       const first = subBody.firstChild;
       if (!first || first === currentStreamingEntry) break;
       const removedHeight = isUserScrolledUp ? (first.offsetHeight + 11) : 0;
+      if (!removedAny) {
+        markProgrammaticScroll();
+        removedAny = true;
+      }
       subBody.removeChild(first);
       if (isUserScrolledUp && removedHeight > 0) {
         subBody.scrollTop = Math.max(0, subBody.scrollTop - removedHeight);
+      }
+    }
+    if (removedAny && subBody) {
+      if (!isUserScrolledUp) {
+        syncPinnedScrollBaseline();
+      } else {
+        lastKnownScrollTop = subBody.scrollTop;
       }
     }
   }
@@ -2550,12 +3714,18 @@
 
     const entry = currentStreamingEntry;
     if (entry) {
+      if (!isUserScrolledUp) {
+        markProgrammaticScroll();
+      }
       entry.classList.remove('streaming');
       if (entry._origText) entry._origText.nodeValue = origTrimmed;
       if (entry._transText) entry._transText.nodeValue = transTrimmed;
       entry._echoSame = isEchoDuplicate(origTrimmed, transTrimmed);
       applyDisplayModeToEntry(entry);
       currentStreamingEntry = null;
+      if (!isUserScrolledUp) {
+        syncPinnedScrollBaseline();
+      }
     }
 
     currentOrigBuffer = '';
@@ -4077,19 +5247,69 @@
   }
 
   let spaNavDebounce = null;
+  let spaContextFollowupTimer = null;
+  function ensureDynamicTitleObserver() {
+    if (!isTopFrame || titleObserver || typeof document === 'undefined' || !window.MutationObserver) return;
+    try {
+      const titleEl = document.querySelector('title');
+      if (titleEl) {
+        titleObserver = new MutationObserver(onSpaNavigationDetected);
+        titleObserver.observe(titleEl, { childList: true, characterData: true, subtree: true });
+      }
+    } catch (e) {}
+  }
+
+  function syncSpaEnhancedContext(rotationReason) {
+    if (isDestroyed || !isTopFrame) return;
+    if (overlay && overlay.style.display !== 'none') {
+      refreshOverlayEnhancedUI();
+    }
+    if (
+      isRunning &&
+      getEffectiveTranslationMode(config) === 'enhanced' &&
+      (isAutoPageContextEnabled(config) || isAutoPresetGlossaryEnabled(config)) &&
+      isLiveTranslateModel(normalizeModelName(config.model)) &&
+      config.protocolMode !== 'legacy'
+    ) {
+      triggerSeamlessSetupRotation(rotationReason);
+    }
+  }
+
   function onSpaNavigationDetected() {
-    if (isTopFrame) ensureOverlayMounted();
+    if (isTopFrame) {
+      ensureOverlayMounted();
+      ensureDynamicTitleObserver();
+    }
     try {
       const cur = (typeof location !== 'undefined' && location && location.href) ? String(location.href) : '';
       if (cur) lastObservedUrl = cur;
     } catch (e) {}
-    if (!isRunning || isDestroyed) return;
+    if (isDestroyed) return;
+    if (isTopFrame) {
+      if (spaContextFollowupTimer) clearTimeout(spaContextFollowupTimer);
+      spaContextFollowupTimer = setTimeout(() => {
+        spaContextFollowupTimer = null;
+        syncSpaEnhancedContext('spa-context-late-sync');
+      }, 1600);
+    }
+    if (!isRunning) {
+      if (isTopFrame && overlay && overlay.style.display !== 'none') {
+        refreshOverlayEnhancedUI();
+      }
+      return;
+    }
     if (spaNavDebounce) clearTimeout(spaNavDebounce);
     spaNavDebounce = setTimeout(() => {
       spaNavDebounce = null;
-      if (!isRunning || isDestroyed) return;
-      if (isTopFrame) ensureOverlayMounted();
+      if (isDestroyed) return;
+      if (isTopFrame) {
+        ensureOverlayMounted();
+        ensureDynamicTitleObserver();
+        refreshOverlayEnhancedUI();
+      }
+      if (!isRunning) return;
       runDomMediaCheck();
+      syncSpaEnhancedContext('spa-context-change');
     }, 400);
   }
 
@@ -5212,21 +6432,56 @@
       };
     }
 
-    return {
-      setup: {
-        model,
-        generationConfig: {
-          responseModalities: [config.responseModality === 'TEXT' ? 'TEXT' : 'AUDIO'],
-          translationConfig: {
-            targetLanguageCode: getBcp47LanguageCode(config.targetLang),
-            echoTargetLanguage: true
-          }
-        },
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        contextWindowCompression: { slidingWindow: {} }
+    const targetCode = getBcp47LanguageCode(config.targetLang);
+    const inputTranscription = {};
+    const rawSrc = String((config && config.sourceLang) || '').trim();
+    if (rawSrc && !/自动识别|auto/i.test(rawSrc)) {
+      const lowerSrc = rawSrc.toLowerCase();
+      if (lowerSrc.includes('日语') || lowerSrc.includes('日語') || lowerSrc.includes('japanese') || /^ja(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['ja-JP'];
+      } else if (lowerSrc.includes('英语') || lowerSrc.includes('english') || /^en(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['en-US'];
+      } else if (lowerSrc.includes('韩语') || lowerSrc.includes('韓語') || lowerSrc.includes('korean') || /^ko(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['ko-KR'];
+      } else if (lowerSrc.includes('繁體') || lowerSrc.includes('繁体') || lowerSrc.includes('traditional') || lowerSrc.includes('zh-tw') || lowerSrc.includes('zh-hant')) {
+        inputTranscription.languageCodes = ['zh-TW'];
+      } else if (lowerSrc.includes('中文') || lowerSrc.includes('chinese') || /^zh(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['zh-CN'];
+      } else if (lowerSrc.includes('法语') || lowerSrc.includes('法語') || lowerSrc.includes('french') || /^fr(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['fr-FR'];
+      } else if (lowerSrc.includes('德语') || lowerSrc.includes('德語') || lowerSrc.includes('german') || /^de(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['de-DE'];
+      } else if (lowerSrc.includes('西班牙') || lowerSrc.includes('spanish') || /^es(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['es-ES'];
+      } else if (lowerSrc.includes('俄语') || lowerSrc.includes('俄語') || lowerSrc.includes('russian') || /^ru(?:\b|-)/.test(lowerSrc)) {
+        inputTranscription.languageCodes = ['ru-RU'];
       }
+    }
+
+    const setupObj = {
+      model,
+      generationConfig: {
+        responseModalities: [config.responseModality === 'TEXT' ? 'TEXT' : 'AUDIO'],
+        translationConfig: {
+          targetLanguageCode: targetCode,
+          echoTargetLanguage: true
+        }
+      },
+      inputAudioTranscription: inputTranscription,
+      outputAudioTranscription: {},
+      contextWindowCompression: { slidingWindow: {} }
     };
+
+    if (config && config.translationMode === 'enhanced') {
+      const sysText = (typeof buildNativeEnhancedSystemInstruction === 'function')
+        ? buildNativeEnhancedSystemInstruction(config)
+        : `Translate all incoming spoken audio into ${targetCode} for real-time simultaneous interpretation. Output only the natural translation of the spoken audio.`;
+      if (sysText) {
+        setupObj.systemInstruction = { parts: [{ text: sysText }] };
+      }
+    }
+
+    return { setup: setupObj };
   }
 
   function createSession(reason) {
@@ -5251,7 +6506,8 @@
       goAwayAt: 0,
       goAwayDeadlineAt: 0,
       hasEmittedTranscript: false,
-      rotationPriority: 'normal'
+      rotationPriority: 'normal',
+      setupSignature: ''
     };
   }
 
@@ -5364,7 +6620,7 @@
       if (silent || session === standbySession) {
         if (standbySession === session) standbySession = null;
         if (activeSession && activeSession.state === 'ready') {
-          const retryMs = activeSession.goAwayDeadlineAt ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
+          const retryMs = (activeSession.goAwayDeadlineAt || hasPendingSetupMismatch(activeSession)) ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
           scheduleRotation(activeSession, 'standby-retry', retryMs);
         }
         return;
@@ -5389,7 +6645,7 @@
         if (isStandbyRole) {
           if (standbySession === session) standbySession = null;
           if (activeSession && activeSession.state === 'ready') {
-            const retryMs = activeSession.goAwayDeadlineAt ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
+            const retryMs = (activeSession.goAwayDeadlineAt || hasPendingSetupMismatch(activeSession)) ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
             scheduleRotation(activeSession, 'standby-timeout-retry', retryMs);
           }
           return;
@@ -5411,6 +6667,7 @@
       let payload;
       try {
         payload = buildSetupPayload();
+        session.setupSignature = computeSetupSignatureForConfig(config);
       } catch (e) {
         closeSession(session, 'setup-error');
         if (session === activeSession) isConnectingUI = false;
@@ -5427,7 +6684,7 @@
         if (isStandbyRole) {
           if (standbySession === session) standbySession = null;
           if (activeSession && activeSession.state === 'ready') {
-            const retryMs = activeSession.goAwayDeadlineAt ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
+            const retryMs = (activeSession.goAwayDeadlineAt || hasPendingSetupMismatch(activeSession)) ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
             scheduleRotation(activeSession, 'standby-send-retry', retryMs);
           }
           return;
@@ -5479,7 +6736,7 @@
         standbySession = null;
         sessionLog('Standby rotation failed, keeping current session', session);
         if (activeSession && activeSession.state === 'ready') {
-          const retryMs = activeSession.goAwayDeadlineAt ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
+          const retryMs = (activeSession.goAwayDeadlineAt || hasPendingSetupMismatch(activeSession)) ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
           scheduleRotation(activeSession, 'standby-closed-retry', retryMs);
         }
         return;
@@ -5559,7 +6816,7 @@
         closeSession(session, 'standby-error');
         if (session === standbySession) standbySession = null;
         if (activeSession && activeSession.state === 'ready') {
-          const retryMs = activeSession.goAwayDeadlineAt ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
+          const retryMs = (activeSession.goAwayDeadlineAt || hasPendingSetupMismatch(activeSession)) ? STANDBY_URGENT_RETRY_MS : STANDBY_RETRY_MS;
           scheduleRotation(activeSession, 'standby-err-retry', retryMs);
         }
         return;
@@ -6582,9 +7839,16 @@
     }, 1200);
   }
 
+  function hasPendingSetupMismatch(sess) {
+    if (!sess || sess.state !== 'ready') return false;
+    return sess.setupSignature !== computeSetupSignatureForConfig(config);
+  }
+
   function scheduleRotation(session, reason, delayMs) {
     if (!session || session !== activeSession) return;
-    const isUrgent = reason === 'go-away' || reason === 'go-away-retry' || !!session.goAwayDeadlineAt;
+    const isServerGoAway = reason === 'go-away' || reason === 'go-away-retry' || !!session.goAwayDeadlineAt;
+    const hasSetupMismatch = hasPendingSetupMismatch(session);
+    const isUrgent = isServerGoAway || hasSetupMismatch;
     if (session.rotationTimer && session.rotationPriority === 'urgent' && !isUrgent) return;
     if (session.rotationTimer) clearTimeout(session.rotationTimer);
     session.rotationPriority = isUrgent ? 'urgent' : 'normal';
@@ -6595,12 +7859,20 @@
       session.rotationTimer = null;
       session.rotationPriority = 'normal';
       if (!isRunning || session !== activeSession || isNetworkOffline || isDestroyed) return;
+      const nowSetupMismatch = hasPendingSetupMismatch(session);
+      const nowServerGoAway = reason === 'go-away' || reason === 'go-away-retry' || !!session.goAwayDeadlineAt;
+      const nowUrgent = nowServerGoAway || nowSetupMismatch;
+      if (!nowServerGoAway && !nowSetupMismatch && hasSetupMismatch) {
+        const elapsed = Math.max(0, now() - (session.readyAt || now()));
+        scheduleRotation(session, 'periodic', Math.max(300, SESSION_ROTATE_MS - elapsed));
+        return;
+      }
       if (standbySession) {
         if (standbySession.state === 'closed') {
           standbySession = null;
         } else if (standbySession.state === 'ready') {
           return;
-        } else if (!isUrgent) {
+        } else if (!nowUrgent) {
           return;
         } else {
           const age = now() - (standbySession.createdAt || 0);
@@ -6612,13 +7884,61 @@
           standbySession = null;
         }
       }
-      sessionLog('Starting standby rotation', session, { reason, urgent: isUrgent });
+      sessionLog('Starting standby rotation', session, { reason, urgent: nowUrgent });
       setDiagnostics({ RotationReason: reason });
-      const standby = createSession(isUrgent ? 'go-away-rotation' : 'rotation');
-      standby.urgent = isUrgent;
+      const standbyReason = nowServerGoAway ? 'go-away-rotation' : (nowSetupMismatch ? 'setup-retry-rotation' : 'rotation');
+      const standby = createSession(standbyReason);
+      standby.urgent = nowUrgent;
       standbySession = standby;
       connectSession(standby, { silent: true });
     }, delay);
+  }
+
+  function triggerSeamlessSetupRotation(reason) {
+    if (!isTopFrame || !isRunning || isDestroyed || isNetworkOffline) return;
+    const desiredSig = computeSetupSignatureForConfig(config);
+
+    if (activeSession && activeSession.state === 'ready' && activeSession.setupSignature === desiredSig) {
+      if (standbySession && standbySession.state !== 'closed' && standbySession.reason !== 'rotation' && standbySession.reason !== 'go-away-rotation') {
+        closeSession(standbySession, 'reverted-to-active-setup');
+        standbySession = null;
+      }
+      return;
+    }
+
+    if (standbySession) {
+      if (standbySession.state === 'closed') {
+        standbySession = null;
+      } else if (standbySession.openedAt > 0 && standbySession.setupSignature !== desiredSig) {
+        closeSession(standbySession, 'setup-superseded');
+        standbySession = null;
+      } else if (standbySession.openedAt === 0 || standbySession.setupSignature === desiredSig) {
+        return;
+      }
+    }
+
+    if (activeSession && activeSession.state === 'ready') {
+      sessionLog('Seamless setup rotation pre-warming standby', activeSession, { reason });
+      setDiagnostics({ RotationReason: reason || 'context-update' });
+      const standby = createSession(reason || 'context-rotation');
+      standby.urgent = true;
+      standbySession = standby;
+      connectSession(standby, { silent: true });
+      return;
+    }
+
+    if (activeSession && activeSession.state === 'connecting') {
+      if (activeSession.openedAt > 0 && activeSession.setupSignature !== desiredSig) {
+        closeSession(activeSession, 'setup-updated-connecting');
+        activeSession = null;
+        connectSession(createSession(reason || 'context-update'));
+      }
+      return;
+    }
+
+    if (!reconnectTimer && !sessionStartTimer) {
+      connectSession(createSession(reason || 'context-update'));
+    }
   }
 
   function promoteStandbyOnActiveDrop() {
@@ -6706,6 +8026,8 @@
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (sessionStartTimer) { clearTimeout(sessionStartTimer); sessionStartTimer = null; }
     if (commitGraceTimer) { clearTimeout(commitGraceTimer); commitGraceTimer = null; }
+    if (customGlossaryRotateTimer) { clearTimeout(customGlossaryRotateTimer); customGlossaryRotateTimer = null; }
+    if (spaContextFollowupTimer) { clearTimeout(spaContextFollowupTimer); spaContextFollowupTimer = null; }
     closeDrainingSession('restart');
     if (standbySession) { closeSession(standbySession, 'restart'); standbySession = null; }
     if (activeSession) { closeSession(activeSession, 'restart'); activeSession = null; }
@@ -6991,7 +8313,9 @@
     if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
     if (silenceFlushTimer) { clearInterval(silenceFlushTimer); silenceFlushTimer = null; }
     if (commitGraceTimer) { clearTimeout(commitGraceTimer); commitGraceTimer = null; }
+    if (customGlossaryRotateTimer) { clearTimeout(customGlossaryRotateTimer); customGlossaryRotateTimer = null; }
     if (spaNavDebounce) { clearTimeout(spaNavDebounce); spaNavDebounce = null; }
+    if (spaContextFollowupTimer) { clearTimeout(spaContextFollowupTimer); spaContextFollowupTimer = null; }
     if (videoWaitTimer) { clearInterval(videoWaitTimer); videoWaitTimer = null; }
     if (domCheckDebounce) { clearTimeout(domCheckDebounce); domCheckDebounce = null; }
     if (mediaReconcileDebounce) { clearTimeout(mediaReconcileDebounce); mediaReconcileDebounce = null; }
@@ -7033,6 +8357,8 @@
     if (configLoadTimer) { clearTimeout(configLoadTimer); configLoadTimer = null; }
     if (resizePersistTimer) { clearTimeout(resizePersistTimer); resizePersistTimer = null; }
     if (syncStyleTimer) { clearTimeout(syncStyleTimer); syncStyleTimer = null; }
+    if (customGlossaryRotateTimer) { clearTimeout(customGlossaryRotateTimer); customGlossaryRotateTimer = null; }
+    if (spaContextFollowupTimer) { clearTimeout(spaContextFollowupTimer); spaContextFollowupTimer = null; }
     if (subframeMediaScanTimer) { clearTimeout(subframeMediaScanTimer); subframeMediaScanTimer = null; }
     isSyncingOverlayStyle = false;
     if (contextCheckTimer) { clearInterval(contextCheckTimer); contextCheckTimer = null; }
@@ -7520,6 +8846,25 @@
           });
           return true;
         }
+        if (msg.action === 'GET_PAGE_CONTEXT') {
+          const state = resolveEffectiveEnhancementState(config);
+          try {
+            sendResponse({
+              status: 'OK',
+              pageContext: state.rawPageCtx,
+              autoMatchedPacks: state.matchedPackIds,
+              matchedSubClusters: state.matchedSubClusters.slice(0, 4).map((s) => ({
+                id: s.id,
+                macroId: s.macroId,
+                name: s.name,
+                score: s.score
+              })),
+              injectedPresetCount: state.injectedPresetCount,
+              translationMode: state.mode
+            });
+          } catch (e) {}
+          return false;
+        }
         if (msg.action === 'GET_STATE') {
           configReadyPromise.then(() => {
             if (isDestroyed) {
@@ -7528,6 +8873,7 @@
             }
             const isVisible = !!(overlay && overlay.style.display !== 'none' && overlay.style.display !== '');
             const ctxValid = !isContextInvalidated && isExtensionContextValid();
+            const enhState = resolveEffectiveEnhancementState(config);
             try {
               sendResponse({
                 status: 'OK',
@@ -7539,6 +8885,16 @@
                 statusKind: currentStatusKind,
                 statusText: currentStatusText,
                 audioMode: config.audioMode,
+                translationMode: enhState.mode,
+                pageContext: enhState.rawPageCtx,
+                autoMatchedPacks: enhState.matchedPackIds,
+                matchedSubClusters: enhState.matchedSubClusters.slice(0, 4).map((s) => ({
+                  id: s.id,
+                  macroId: s.macroId,
+                  name: s.name,
+                  score: s.score
+                })),
+                injectedPresetCount: enhState.injectedPresetCount,
                 mediaCount: collectCandidateVideos().length,
                 isContextValid: ctxValid,
                 circuitBreaker: circuitBreakerTripped,
